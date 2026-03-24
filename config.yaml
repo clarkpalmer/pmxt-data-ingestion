@@ -1,0 +1,32 @@
+# pmxt-data-ingestion configuration
+# Edit this file to control what data gets downloaded and filtered.
+
+# Date range (inclusive). Format: YYYY-MM-DD
+start_date: "2026-03-21"
+end_date: "2026-03-23"
+
+# Which markets to download. Each entry needs:
+#   asset: btc, eth, sol, etc.
+#   duration: 5m, 15m
+#
+# Slug pattern is: {asset}-updown-{duration}-{unix_timestamp}
+# The script discovers condition IDs automatically via the Gamma API.
+markets:
+  - asset: btc
+    duration: 5m
+  # - asset: btc
+  #   duration: 15m
+  # - asset: eth
+  #   duration: 5m
+  # - asset: sol
+  #   duration: 5m
+
+# Where to store data (relative to this repo)
+data_dir: data
+
+# Download settings
+download:
+  # Max concurrent connections for aria2c
+  connections: 4
+  # Temp directory for raw archive files before filtering
+  temp_dir: /tmp/pmxt_ingestion
