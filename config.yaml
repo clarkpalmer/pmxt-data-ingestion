@@ -1,8 +1,13 @@
 # pmxt-data-ingestion configuration
 # Edit this file to control what data gets downloaded and filtered.
 
-# Date range (inclusive). Format: YYYY-MM-DD
-start_date: "2026-03-21"
+# Date range (inclusive).
+# Use YYYY-MM-DD for full days, or YYYY-MM-DDTHH for specific hours (UTC).
+# Examples:
+#   "2026-03-23" to "2026-03-23"           → full day
+#   "2026-03-23T00" to "2026-03-23T02"     → just hours 00, 01, 02 UTC
+#   "2026-03-22T22" to "2026-03-23T02"     → cross-midnight range
+start_date: "2026-03-23"
 end_date: "2026-03-23"
 
 # Which markets to download. Each entry needs:
@@ -14,12 +19,12 @@ end_date: "2026-03-23"
 markets:
   - asset: btc
     duration: 5m
-  # - asset: btc
-  #   duration: 15m
-  # - asset: eth
-  #   duration: 5m
-  # - asset: sol
-  #   duration: 5m
+  - asset: btc
+    duration: 15m
+  - asset: eth
+    duration: 5m
+  - asset: sol
+    duration: 5m
 
 # Where to store data (relative to this repo)
 data_dir: data

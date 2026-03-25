@@ -25,8 +25,8 @@ import duckdb
 
 from common import (
     load_config, load_checkpoint, save_checkpoint, data_dir, orderbook_dir,
-    condition_ids_path, date_range, discover_condition_ids,
-    get_archive_file_list,
+    condition_ids_path, date_range, hour_range, timestamp_range,
+    discover_condition_ids, get_archive_file_list,
 )
 
 
@@ -116,9 +116,13 @@ def show_status(cfg):
     cp = load_checkpoint(cfg)
     downloaded = set(cp.get("downloaded_hours", []))
     cids = cp.get("discovered_cids", {})
+    target_hours = hour_range(cfg)
     dates = date_range(cfg)
+    start_ts, end_ts = timestamp_range(cfg)
 
-    print(f"Config: {len(cfg['markets'])} market type(s), {len(dates)} day(s)")
+    print(f"Config: {len(cfg['markets'])} market type(s)")
+    print(f"Range: {cfg['start_date']} to {cfg['end_date']} ({len(target_hours)} hours)")
+    print(f"Timestamps: {start_ts} to {end_ts}")
     print(f"Condition IDs discovered: {len(cids)}")
     print(f"Archive hours downloaded: {len(downloaded)}")
 
@@ -129,11 +133,18 @@ def show_status(cfg):
         if m:
             hours_by_day[m.group(1)].add(int(m.group(2)))
 
+    # Target hours by day
+    target_by_day = defaultdict(set)
+    for d, h in target_hours:
+        target_by_day[d].add(int(h))
+
     print(f"\nCoverage:")
     ob_dir = orderbook_dir(cfg)
     for day in dates:
-        hours = sorted(hours_by_day.get(day, set()))
-        status = "COMPLETE" if len(hours) == 24 else f"{len(hours)}/24"
+        target_h = sorted(target_by_day.get(day, set()))
+        done_h = sorted(hours_by_day.get(day, set()) & set(target_h))
+        n_target = len(target_h)
+        status = "COMPLETE" if len(done_h) == n_target else f"{len(done_h)}/{n_target}"
         day_file = ob_dir / f"orderbook_{day}.parquet"
         size = ""
         if day_file.exists():
@@ -144,7 +155,7 @@ def show_status(cfg):
             ).fetchone()[0]
             con.close()
             size = f"  ({n:,} rows, {mb:.1f} MB)"
-        print(f"  {day}: {status}{size}")
+        print(f"  {day}: {status} (hours {target_h[0]:02d}-{target_h[-1]:02d}){size}")
 
 
 def main():
@@ -188,8 +199,8 @@ def main():
     print("=" * 60)
     all_urls = get_archive_file_list()
 
-    # Filter to our date range
-    target_dates = set(date_range(cfg))
+    # Filter to our hour range
+    target_hours_set = set(hour_range(cfg))  # set of (date_str, hour_str)
     downloaded = set(cp.get("downloaded_hours", []))
 
     to_process = []
@@ -197,7 +208,7 @@ def main():
         m = re.search(r'(\d{4}-\d{2}-\d{2})T(\d{2})', fname)
         if not m:
             continue
-        if m.group(1) not in target_dates:
+        if (m.group(1), m.group(2)) not in target_hours_set:
             continue
         if fname in downloaded:
             continue
@@ -205,9 +216,11 @@ def main():
 
     in_range = sum(
         1 for f in all_urls
-        if any(d in f for d in target_dates)
+        if re.search(r'(\d{4}-\d{2}-\d{2})T(\d{2})', f)
+        and (re.search(r'(\d{4}-\d{2}-\d{2})T(\d{2})', f).group(1),
+             re.search(r'(\d{4}-\d{2}-\d{2})T(\d{2})', f).group(2)) in target_hours_set
     )
-    print(f"\nArchive files in date range: {in_range}")
+    print(f"\nArchive files in range: {in_range} ({len(target_hours_set)} hours requested)")
     print(f"Already downloaded: {len(downloaded)}")
     print(f"Remaining: {len(to_process)}")
 

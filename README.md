@@ -154,10 +154,23 @@ data/
 | `timestamp` | int | Unix timestamp |
 | `outcome` | string | Which outcome token was traded |
 
+## Known Limitations: Orderbook Coverage
+
+The PMXT archive captures orderbook events for **all** Polymarket markets (~13,000+ per hourly file). For short-duration crypto markets (5m, 15m), orderbook activity is extremely bursty — most of it happens in a narrow window around market creation and resolution. In practice, this means:
+
+- **The first and last hourly files of the day (T00, T23) contain the vast majority of crypto market orderbook data** — this is when market makers create and close positions for the full day's markets.
+- **Mid-day hourly files have very few rows** for your crypto markets (often single digits or zero), even though the raw archive files are 200-300MB each (full of data for other Polymarket markets).
+- **Typical coverage: ~30-40% of configured markets will have orderbook data.** The exact number depends on the date and market type. Hour 00 often has 90%+ coverage; mid-day hours may have 15-30%.
+
+**Trade data and resolutions are not affected** — those come from separate Polymarket APIs and typically have 95%+ coverage.
+
+The `report.py` script gives a detailed breakdown of what has coverage and what's missing, so you can assess data completeness before using it.
+
 ## Notes
 
 - The PMXT archive publishes hourly. Files typically appear within a few minutes of the hour.
-- Raw archive files are large (500MB-1.5GB). The script downloads one at a time, filters immediately, and deletes the raw file. Peak temp disk usage is ~1.5GB.
+- Raw archive files are large (200MB-1.5GB). The script downloads one at a time, filters immediately, and deletes the raw file. Peak temp disk usage is ~1.5GB.
 - Condition ID discovery via the Gamma API takes ~1 request per market at 5 req/s. For a full day of BTC 5m markets (288), this takes about a minute.
 - The Polymarket Data API has an offset cap of 3000 per market. Very high-volume markets may have truncated early-window trade data.
 - aria2c is optional but recommended — it uses multiple connections for ~2-4x faster downloads.
+- No API keys required — all data sources (PMXT archive, Gamma API, Polymarket Data API) are public.

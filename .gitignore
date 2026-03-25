@@ -2,3 +2,5 @@ data/
 __pycache__/
 *.pyc
 .env
+diagnose.py
+tz_test.py

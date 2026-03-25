@@ -71,17 +71,77 @@ def save_checkpoint(cfg, cp):
         json.dump(cp, f, indent=2)
 
 
+def parse_date_spec(s):
+    """Parse a date spec like '2026-03-23' or '2026-03-23T14' into a UTC datetime.
+
+    Returns (datetime_utc, has_hour).
+    """
+    s = str(s)
+    if "T" in s:
+        dt = datetime.strptime(s, "%Y-%m-%dT%H").replace(tzinfo=timezone.utc)
+        return dt, True
+    else:
+        dt = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return dt, False
+
+
+def timestamp_range(cfg):
+    """Return (start_ts, end_ts) as UTC unix timestamps for the configured range.
+
+    For hour-level specs: exact hours.
+    For day-level specs: full days (00:00 to 24:00).
+    """
+    start_dt, start_has_hour = parse_date_spec(cfg["start_date"])
+    end_dt, end_has_hour = parse_date_spec(cfg["end_date"])
+
+    start_ts = int(start_dt.timestamp())
+
+    if end_has_hour:
+        # End hour is inclusive — go through the end of that hour
+        end_ts = int(end_dt.timestamp()) + 3600
+    else:
+        # End date is inclusive — go through end of that day
+        end_ts = int(end_dt.timestamp()) + 86400
+
+    return start_ts, end_ts
+
+
 def date_range(cfg):
     """Return list of date strings from start_date to end_date inclusive."""
     from datetime import timedelta
-    start = datetime.strptime(cfg["start_date"], "%Y-%m-%d")
-    end = datetime.strptime(cfg["end_date"], "%Y-%m-%d")
+    start_dt, _ = parse_date_spec(cfg["start_date"])
+    end_dt, _ = parse_date_spec(cfg["end_date"])
+    # Round to day boundaries
+    start_day = start_dt.replace(hour=0, minute=0, second=0)
+    end_day = end_dt.replace(hour=0, minute=0, second=0)
     dates = []
-    d = start
-    while d <= end:
+    d = start_day
+    while d <= end_day:
         dates.append(d.strftime("%Y-%m-%d"))
         d += timedelta(days=1)
     return dates
+
+
+def hour_range(cfg):
+    """Return list of (date_str, hour_str) tuples for the configured range.
+
+    Useful for matching against archive filenames like '2026-03-23T14'.
+    """
+    from datetime import timedelta
+    start_dt, start_has_hour = parse_date_spec(cfg["start_date"])
+    end_dt, end_has_hour = parse_date_spec(cfg["end_date"])
+
+    if not start_has_hour:
+        start_dt = start_dt.replace(hour=0)
+    if not end_has_hour:
+        end_dt = end_dt.replace(hour=23)
+
+    hours = []
+    dt = start_dt
+    while dt <= end_dt:
+        hours.append((dt.strftime("%Y-%m-%d"), f"{dt.hour:02d}"))
+        dt += timedelta(hours=1)
+    return hours
 
 
 def duration_seconds(duration_str):
@@ -103,16 +163,9 @@ def discover_condition_ids(cfg, progress=True):
 
     Returns dict: {slug: condition_id}
     """
-    dates = date_range(cfg)
-    if not dates:
+    start_ts, end_ts = timestamp_range(cfg)
+    if start_ts >= end_ts:
         return {}
-
-    # Compute the full timestamp range
-    start_dt = datetime.strptime(dates[0], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    # End date is inclusive — go through 23:59 of that day
-    end_dt = datetime.strptime(dates[-1], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    end_ts = int(end_dt.timestamp()) + 86400  # midnight of next day
-    start_ts = int(start_dt.timestamp())
 
     all_cids = {}
     session = requests.Session()

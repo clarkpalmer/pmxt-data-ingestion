@@ -154,7 +154,8 @@ def report_resolutions(cfg):
         print(f"    Mean:  ${stats[2]:,.2f}")
 
     # By asset
-    if "asset" in con.execute(f"SELECT * FROM read_parquet('{r_file}') LIMIT 0").columns:
+    cols = [desc[0] for desc in con.execute(f"SELECT * FROM read_parquet('{r_file}') LIMIT 0").description]
+    if "asset" in cols:
         assets = con.execute(f"""
             SELECT asset, duration, COUNT(*) as cnt,
                    SUM(CASE WHEN outcome = 'Up' THEN 1 ELSE 0 END) as up_cnt
@@ -171,13 +172,15 @@ def report_resolutions(cfg):
 
 
 def report_coverage(cfg):
-    """Cross-reference orderbook, trades, and resolutions."""
+    """Cross-reference orderbook, trades, and resolutions with detailed breakdown."""
     cid_file = condition_ids_path(cfg)
     if not cid_file.exists():
         return
 
     with open(cid_file) as f:
         cids = json.load(f)
+
+    cid_to_slug = {v: k for k, v in cids.items()}
 
     ob_dir = orderbook_dir(cfg)
     ob_files = sorted(ob_dir.glob("orderbook_*.parquet"))
@@ -187,23 +190,35 @@ def report_coverage(cfg):
 
     all_cid_set = set(cids.values())
 
-    # CIDs in orderbook
+    # CIDs in orderbook (with row counts and update types)
     ob_cids = set()
+    ob_rows = {}  # cid -> row count
+    ob_snapshots = set()  # cids with book_snapshot data
     if ob_files:
         file_list = ", ".join(f"'{f}'" for f in ob_files)
         for row in con.execute(f"""
-            SELECT DISTINCT market_id FROM read_parquet([{file_list}])
+            SELECT market_id, COUNT(*) as cnt,
+                   SUM(CASE WHEN data LIKE '%book_snapshot%' THEN 1 ELSE 0 END) as snap_cnt
+            FROM read_parquet([{file_list}])
+            GROUP BY market_id
         """).fetchall():
             ob_cids.add(row[0])
+            ob_rows[row[0]] = row[1]
+            if row[2] > 0:
+                ob_snapshots.add(row[0])
 
-    # CIDs in trades
+    # CIDs in trades (with counts)
     trade_cids = set()
+    trade_counts = {}
     t_file = trades_dir(cfg) / "trades.parquet"
     if t_file.exists():
         for row in con.execute(f"""
-            SELECT DISTINCT condition_id FROM read_parquet('{t_file}')
+            SELECT condition_id, COUNT(*) as cnt
+            FROM read_parquet('{t_file}')
+            GROUP BY condition_id
         """).fetchall():
             trade_cids.add(row[0])
+            trade_counts[row[0]] = row[1]
 
     # CIDs in resolutions
     res_cids = set()
@@ -217,23 +232,98 @@ def report_coverage(cfg):
     con.close()
 
     has_ob = all_cid_set & ob_cids
+    has_snapshots = all_cid_set & ob_snapshots
     has_trades = all_cid_set & trade_cids
     has_res = all_cid_set & res_cids
     has_all = has_ob & has_trades & has_res
+    no_ob = all_cid_set - ob_cids
+    no_trades = all_cid_set - trade_cids
 
-    print(f"  Configured markets: {len(all_cid_set)}")
-    print(f"  With orderbook data: {len(has_ob)}")
-    print(f"  With trade data: {len(has_trades)}")
-    print(f"  With resolution data: {len(has_res)}")
-    print(f"  With ALL three: {len(has_all)}")
-    missing_ob = all_cid_set - ob_cids
-    if missing_ob and len(missing_ob) <= 20:
-        # Find slugs for missing CIDs
-        cid_to_slug = {v: k for k, v in cids.items()}
-        print(f"  Missing orderbook ({len(missing_ob)}):")
-        for cid in sorted(missing_ob):
-            slug = cid_to_slug.get(cid, cid[:16] + "...")
-            print(f"    {slug}")
+    # Summary
+    print(f"  Configured markets:          {len(all_cid_set)}")
+    print(f"  With orderbook data:         {len(has_ob):>4} ({len(has_ob)/len(all_cid_set)*100:.0f}%)")
+    print(f"    - with book_snapshots:     {len(has_snapshots):>4} (full depth orderbook)")
+    print(f"    - price_changes only:      {len(has_ob - has_snapshots):>4} (order activity, no full book)")
+    print(f"  With trade data:             {len(has_trades):>4} ({len(has_trades)/len(all_cid_set)*100:.0f}%)")
+    print(f"  With resolution data:        {len(has_res):>4} ({len(has_res)/len(all_cid_set)*100:.0f}%)")
+    print(f"  With ALL three:              {len(has_all):>4} ({len(has_all)/len(all_cid_set)*100:.0f}%)")
+    print(f"  Missing orderbook:           {len(no_ob):>4}")
+    print(f"  Missing trades:              {len(no_trades):>4}")
+
+    # Breakdown by market type
+    type_stats = defaultdict(lambda: {"total": 0, "ob": 0, "snap": 0, "trades": 0, "res": 0, "all": 0})
+    for slug, cid in cids.items():
+        # Parse type from slug: btc-updown-5m-{ts} -> btc-5m
+        parts = slug.split("-")
+        if len(parts) >= 4:
+            mtype = f"{parts[0]}-{parts[2]}"
+        else:
+            mtype = "unknown"
+        type_stats[mtype]["total"] += 1
+        if cid in has_ob:
+            type_stats[mtype]["ob"] += 1
+        if cid in has_snapshots:
+            type_stats[mtype]["snap"] += 1
+        if cid in has_trades:
+            type_stats[mtype]["trades"] += 1
+        if cid in has_res:
+            type_stats[mtype]["res"] += 1
+        if cid in has_all:
+            type_stats[mtype]["all"] += 1
+
+    print(f"\n  By market type:")
+    print(f"  {'Type':>10}  {'Total':>5}  {'Orderbook':>10}  {'Snapshots':>10}  {'Trades':>8}  {'Resolved':>8}  {'All 3':>7}")
+    print(f"  {'-'*10}  {'-'*5}  {'-'*10}  {'-'*10}  {'-'*8}  {'-'*8}  {'-'*7}")
+    for mtype in sorted(type_stats):
+        s = type_stats[mtype]
+        print(f"  {mtype:>10}  {s['total']:5d}  {s['ob']:4d} ({s['ob']/s['total']*100:4.0f}%)  "
+              f"{s['snap']:4d} ({s['snap']/s['total']*100:4.0f}%)  "
+              f"{s['trades']:4d} ({s['trades']/s['total']*100:3.0f}%)  "
+              f"{s['res']:4d} ({s['res']/s['total']*100:3.0f}%)  "
+              f"{s['all']:4d} ({s['all']/s['total']*100:3.0f}%)")
+
+    # Orderbook coverage by market start hour (UTC)
+    if has_ob or no_ob:
+        print(f"\n  Orderbook coverage by market start hour (UTC):")
+        hour_stats = defaultdict(lambda: {"total": 0, "with_ob": 0})
+        for slug, cid in cids.items():
+            try:
+                ts = int(slug.rsplit("-", 1)[1])
+                h = datetime.fromtimestamp(ts, tz=timezone.utc).hour
+            except (ValueError, IndexError):
+                continue
+            hour_stats[h]["total"] += 1
+            if cid in has_ob:
+                hour_stats[h]["with_ob"] += 1
+
+        for h in range(24):
+            s = hour_stats[h]
+            if s["total"] == 0:
+                continue
+            pct = s["with_ob"] / s["total"] * 100
+            filled = int(pct / 5)  # each # = 5%
+            bar = "#" * filled + "." * (20 - filled)
+            print(f"    {h:02d}:00  {s['with_ob']:3d}/{s['total']:3d}  ({pct:5.1f}%)  {bar}")
+
+    # Orderbook data quality for markets that DO have data
+    if has_ob:
+        row_counts = [ob_rows[cid] for cid in has_ob]
+        row_counts.sort()
+        median_rows = row_counts[len(row_counts) // 2]
+        print(f"\n  Orderbook row distribution (for {len(has_ob)} markets with data):")
+        print(f"    Min: {row_counts[0]:,}, Median: {median_rows:,}, Max: {row_counts[-1]:,}")
+
+        # Bucket by row count
+        buckets = [(1, 10), (11, 100), (101, 1000), (1001, 10000), (10001, 1000000)]
+        for lo, hi in buckets:
+            n = sum(1 for r in row_counts if lo <= r <= hi)
+            if n > 0:
+                print(f"    {lo:>6}-{hi:>7} rows: {n:4d} markets")
+
+    # Markets missing both orderbook and trade data
+    missing_both = no_ob & no_trades
+    if missing_both:
+        print(f"\n  WARNING: {len(missing_both)} markets have NEITHER orderbook nor trade data")
 
 
 def main():
