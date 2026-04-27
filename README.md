@@ -2,7 +2,7 @@
 
 Download, filter, and enrich Polymarket crypto prediction market data from the [PMXT archive](https://archive.pmxt.dev).
 
-Downloads hourly orderbook snapshots, filters to only the crypto markets you care about, and optionally enriches with trade data, resolutions, and strike prices from the Polymarket APIs.
+Downloads hourly orderbook snapshots from the PMXT v2 archive, filters to only the crypto markets you care about, and optionally enriches with trade data, resolutions, and strike prices from the Polymarket APIs. Supports both v1 and v2 archive formats.
 
 ## Supported Markets
 
@@ -11,6 +11,7 @@ Downloads hourly orderbook snapshots, filters to only the crypto markets you car
 | BTC | 5m, 15m | `btc-updown-{duration}-{timestamp}` |
 | ETH | 5m | `eth-updown-5m-{timestamp}` |
 | SOL | 5m | `sol-updown-5m-{timestamp}` |
+| XRP | 5m | `xrp-updown-5m-{timestamp}` |
 
 More assets/durations may exist — just add them to config.yaml and the script will try to discover them.
 
@@ -106,11 +107,11 @@ python enrich.py --status       # Show progress
 
 ### `report.py` — Data Report
 
-Shows what data you have: row counts, date coverage, market counts, trade volume, resolution stats, and cross-references which markets have orderbook + trades + resolutions.
+Shows what data you have: row counts, date coverage, market counts, trade volume, resolution stats, and cross-references which markets have orderbook + trades + resolutions. Saves a timestamped markdown report to `reports/`.
 
 ```bash
-python report.py              # Full report
-python report.py --summary    # Short summary
+python report.py              # Full report (also saves to reports/)
+python report.py --summary    # Short summary (orderbook + coverage only)
 ```
 
 ## Output Structure
@@ -126,9 +127,34 @@ data/
 ├── resolutions.parquet
 ├── condition_ids.json          # slug → condition ID mapping
 └── checkpoint.json             # download/enrichment progress
+reports/
+└── report_20260327_120000.md   # timestamped markdown reports
 ```
 
 ## Orderbook Parquet Schema
+
+The PMXT archive has two schema versions. The download and report scripts handle both automatically.
+
+### V2 (current)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `timestamp_received` | int64 | When the update was received |
+| `timestamp` | int64 | When the update was created |
+| `market` | binary (UTF-8) | Condition ID (hex) identifying the market |
+| `event_type` | string | `book`, `price_change`, `last_trade_price`, `tick_size_change` |
+| `asset_id` | binary (UTF-8) | Token ID |
+| `bids` | binary (UTF-8) | JSON bid levels |
+| `asks` | binary (UTF-8) | JSON ask levels |
+| `price` | int32 | Price (scaled) |
+| `size` | int64 | Size |
+| `side` | string | Side |
+| `best_bid` | int32 | Best bid price |
+| `best_ask` | int32 | Best ask price |
+| `fee_rate_bps` | int32 | Fee rate in basis points |
+| `transaction_hash` | binary (UTF-8) | Transaction hash |
+
+### V1 (legacy)
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -138,7 +164,7 @@ data/
 | `update_type` | string | `book_snapshot` or `price_change` |
 | `data` | string | JSON payload with orderbook/price data |
 
-**`book_snapshot`** — Full orderbook state (all levels, both sides). Fires after trades.
+**`book` / `book_snapshot`** — Full orderbook state (all levels, both sides). Fires after trades.
 
 **`price_change`** — Order placement or cancellation (NOT a trade). Contains token_id, side, best_bid, best_ask, change details.
 

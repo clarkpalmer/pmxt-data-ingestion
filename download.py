@@ -59,16 +59,29 @@ def download_file(url, dest, connections=4):
 def filter_parquet(filepath, cid_set, out_file):
     """Filter a parquet file to only rows matching our condition IDs.
 
+    V2 schema: 'market' column is Binary (UTF-8 encoded condition ID).
+    V1 schema: 'market_id' column is String.
+
     Returns number of rows written.
     """
     con = duckdb.connect()
     con.execute("CREATE TEMP TABLE cids (cid VARCHAR)")
     con.executemany("INSERT INTO cids VALUES (?)", [(c,) for c in cid_set])
 
+    # Detect schema: v2 has 'market' (binary), v1 has 'market_id' (string)
+    cols = [row[0] for row in con.execute(
+        f"SELECT name FROM parquet_schema('{filepath}')"
+    ).fetchall()]
+
+    if 'market' in cols and 'market_id' not in cols:
+        market_expr = "CAST(market AS VARCHAR)"
+    else:
+        market_expr = "market_id"
+
     con.execute(f"""
         COPY (
             SELECT * FROM read_parquet('{filepath}')
-            WHERE market_id IN (SELECT cid FROM cids)
+            WHERE {market_expr} IN (SELECT cid FROM cids)
         ) TO '{out_file}' (FORMAT PARQUET, COMPRESSION SNAPPY)
     """)
     con.close()

@@ -12,8 +12,8 @@ import yaml
 CONFIG_FILE = Path(__file__).parent / "config.yaml"
 GAMMA_API = "https://gamma-api.polymarket.com/events"
 DATA_API = "https://data-api.polymarket.com/trades"
-PMXT_ARCHIVE = "https://archive.pmxt.dev/Polymarket"
-PMXT_DOWNLOAD = "https://r2.pmxt.dev"
+PMXT_ARCHIVE = "https://archive.pmxt.dev/Polymarket/v2"
+PMXT_DOWNLOAD = "https://r2v2.pmxt.dev"
 
 
 def load_config():
@@ -239,7 +239,7 @@ def get_archive_file_list():
                 url = PMXT_ARCHIVE if page == 1 else f"{PMXT_ARCHIVE}?page={page}"
                 resp = session.get(url, timeout=30)
                 urls = set(re.findall(
-                    r'https://r2\.pmxt\.dev/[a-zA-Z0-9_.-]*parquet', resp.text
+                    r'https://r2(?:v2)?\.pmxt\.dev/[a-zA-Z0-9_.-]*parquet', resp.text
                 ))
                 if urls:
                     break
