@@ -1,3 +1,4 @@
+archive_version: v2
 data_dir: data
 download:
   connections: 4

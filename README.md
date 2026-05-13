@@ -46,6 +46,9 @@ python report.py
 Edit `config.yaml`:
 
 ```yaml
+# Archive version: "v2" (default, recommended) or "v1" (legacy)
+archive_version: v2
+
 start_date: "2026-03-21"
 end_date: "2026-03-23"
 
@@ -61,6 +64,15 @@ download:
   connections: 4
   temp_dir: /tmp/pmxt_ingestion
 ```
+
+### Archive Versions
+
+| Version | Archive URL | Download URL | Schema |
+|---------|------------|-------------|--------|
+| **v2** (default) | `archive.pmxt.dev/Polymarket/v2` | `r2v2.pmxt.dev` | Flattened columns (`market`, `event_type`, `bids`, `asks`, etc.) |
+| **v1** (legacy) | `archive.pmxt.dev/Polymarket` | `r2.pmxt.dev` | JSON blob (`market_id`, `update_type`, `data`) |
+
+Both versions are supported. The download and report scripts auto-detect the parquet schema, so you can switch versions without changing anything else. Set `archive_version: v1` if you need the legacy format.
 
 ## Scripts
 

@@ -210,7 +210,7 @@ def main():
     print("\n" + "=" * 60)
     print("Step 2: Fetching archive file list")
     print("=" * 60)
-    all_urls = get_archive_file_list()
+    all_urls = get_archive_file_list(cfg)
 
     # Filter to our hour range
     target_hours_set = set(hour_range(cfg))  # set of (date_str, hour_str)

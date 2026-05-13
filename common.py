@@ -12,8 +12,18 @@ import yaml
 CONFIG_FILE = Path(__file__).parent / "config.yaml"
 GAMMA_API = "https://gamma-api.polymarket.com/events"
 DATA_API = "https://data-api.polymarket.com/trades"
-PMXT_ARCHIVE = "https://archive.pmxt.dev/Polymarket/v2"
-PMXT_DOWNLOAD = "https://r2v2.pmxt.dev"
+PMXT_ENDPOINTS = {
+    "v2": {
+        "archive": "https://archive.pmxt.dev/Polymarket/v2",
+        "download": "https://r2v2.pmxt.dev",
+        "url_pattern": r'https://r2v2\.pmxt\.dev/[a-zA-Z0-9_.-]*parquet',
+    },
+    "v1": {
+        "archive": "https://archive.pmxt.dev/Polymarket",
+        "download": "https://r2.pmxt.dev",
+        "url_pattern": r'https://r2\.pmxt\.dev/[a-zA-Z0-9_.-]*parquet',
+    },
+}
 
 
 def load_config():
@@ -21,14 +31,24 @@ def load_config():
     with open(CONFIG_FILE) as f:
         cfg = yaml.safe_load(f)
 
-    # Validate required fields
     for field in ["start_date", "end_date", "markets", "data_dir"]:
         if field not in cfg:
             raise ValueError(f"Missing required config field: {field}")
 
     cfg["start_date"] = str(cfg["start_date"])
     cfg["end_date"] = str(cfg["end_date"])
+
+    version = cfg.get("archive_version", "v2")
+    if version not in PMXT_ENDPOINTS:
+        raise ValueError(f"Unknown archive_version: {version!r} (use 'v1' or 'v2')")
+    cfg["archive_version"] = version
+
     return cfg
+
+
+def archive_endpoints(cfg):
+    """Return the PMXT endpoint URLs for the configured archive version."""
+    return PMXT_ENDPOINTS[cfg["archive_version"]]
 
 
 def data_dir(cfg):
@@ -222,12 +242,17 @@ def discover_condition_ids(cfg, progress=True):
     return all_cids
 
 
-def get_archive_file_list():
+def get_archive_file_list(cfg):
     """Fetch list of available parquet files from the PMXT archive.
 
     Returns dict: {filename: url}
     """
-    print("Fetching file list from PMXT archive...", flush=True)
+    ep = archive_endpoints(cfg)
+    archive_url = ep["archive"]
+    url_pattern = ep["url_pattern"]
+    version = cfg["archive_version"]
+
+    print(f"Fetching file list from PMXT archive ({version})...", flush=True)
     session = requests.Session()
     all_urls = {}
     consecutive_empty = 0
@@ -236,11 +261,9 @@ def get_archive_file_list():
         urls = set()
         for attempt in range(3):
             try:
-                url = PMXT_ARCHIVE if page == 1 else f"{PMXT_ARCHIVE}?page={page}"
+                url = archive_url if page == 1 else f"{archive_url}?page={page}"
                 resp = session.get(url, timeout=30)
-                urls = set(re.findall(
-                    r'https://r2(?:v2)?\.pmxt\.dev/[a-zA-Z0-9_.-]*parquet', resp.text
-                ))
+                urls = set(re.findall(url_pattern, resp.text))
                 if urls:
                     break
                 time.sleep(1)
