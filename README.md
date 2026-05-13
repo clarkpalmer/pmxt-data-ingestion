@@ -43,24 +43,52 @@ python report.py
 
 ## Configuration
 
-Edit `config.yaml`:
+Edit `config.yaml`. You can use any combination of market selectors — they all resolve to condition IDs used for filtering.
 
 ```yaml
 start_date: "2026-03-21"
 end_date: "2026-03-23"
+data_dir: data
+download:
+  connections: 4
+  temp_dir: /tmp/pmxt_ingestion
 
+# Updown crypto markets (asset + duration shorthand)
 markets:
   - asset: btc
     duration: 5m
   - asset: eth
-    duration: 5m
+    duration: 15m
 
-data_dir: data
+# Arbitrary market slugs
+slugs:
+  - "will-bitcoin-reach-122k-september-15-21"
+  - "nba-bos-cle-2026-03-08-spread-home-4pt5"
 
-download:
-  connections: 4
-  temp_dir: /tmp/pmxt_ingestion
+# Direct condition IDs (no API lookup)
+condition_ids:
+  - "0x94b3610eec4e5ef8..."
+
+# Event IDs (all markets under an event)
+event_ids:
+  - "196660"
+
+# Tags (search Gamma API)
+tags:
+  - "crypto"
 ```
+
+### Market Selectors
+
+| Selector | Description | API calls |
+|----------|-------------|-----------|
+| `markets` | Updown crypto shorthand (`{asset}-updown-{duration}-{ts}`) | 1 per market per time window |
+| `slugs` | Any Polymarket slug | 1 per slug |
+| `condition_ids` | Hex condition IDs — direct, no lookup | None |
+| `event_ids` | All markets under a Polymarket event | 1 per event |
+| `tags` | Search by Polymarket tag | Paginated search |
+
+All selectors can be combined. At least one must be present.
 
 ## Scripts
 
