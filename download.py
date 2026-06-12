@@ -96,32 +96,64 @@ def filter_parquet(filepath, cid_set, out_file):
     return 0
 
 
+def hourly_chunk_dir(cfg):
+    """Canonical directory for filtered hourly chunks awaiting merge.
+
+    Lives inside the data dir (NOT /tmp): chunks are checkpointed as
+    downloaded the moment they're filtered, so they must survive reboots and
+    be visible to both the CLI and the dashboard until merged.
+    """
+    d = orderbook_dir(cfg) / "hourly"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def merge_hourly_to_daily(hourly_dir, date_str, out_dir):
-    """Merge hourly chunk files into a single daily parquet."""
+    """Merge hourly chunk files INTO the daily parquet (union, not replace).
+
+    The daily file may already contain hours merged earlier — an incremental
+    top-up download must add to it, never overwrite it with only the new
+    hours. Rows are deduped (DISTINCT) so a re-filtered hour can't double up,
+    and the output is written to a temp file then atomically renamed so an
+    interrupted merge never corrupts the existing daily file. Chunks are
+    deleted only after the new daily file is safely in place.
+    """
     hourly_files = sorted(hourly_dir.glob(f"chunk_{date_str}_T*.parquet"))
     if not hourly_files:
         return 0
 
     out_file = out_dir / f"orderbook_{date_str}.parquet"
-    con = duckdb.connect()
-    file_list = ", ".join(f"'{f}'" for f in hourly_files)
-    con.execute(f"""
-        COPY (
-            SELECT * FROM read_parquet([{file_list}])
-            ORDER BY timestamp_received
-        ) TO '{out_file}' (FORMAT PARQUET, COMPRESSION SNAPPY)
-    """)
-    n = con.execute(
-        f"SELECT COUNT(*) FROM read_parquet('{out_file}')"
-    ).fetchone()[0]
-    con.close()
+    sources = list(hourly_files)
+    if out_file.exists():
+        sources.append(out_file)
 
-    # Clean up hourly chunks
+    tmp_file = out_dir / f".orderbook_{date_str}.parquet.tmp"
+    con = duckdb.connect()
+    try:
+        file_list = ", ".join(f"'{f}'" for f in sources)
+        con.execute(f"""
+            COPY (
+                SELECT DISTINCT * FROM read_parquet([{file_list}])
+                ORDER BY timestamp_received
+            ) TO '{tmp_file}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+        """)
+        n = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{tmp_file}')"
+        ).fetchone()[0]
+    except Exception:
+        tmp_file.unlink(missing_ok=True)
+        raise
+    finally:
+        con.close()
+
+    tmp_file.replace(out_file)
+
+    # Clean up hourly chunks only now that the daily file is safely written
     for f in hourly_files:
         f.unlink()
 
     size_mb = out_file.stat().st_size / 1e6
-    print(f"  Merged {date_str}: {len(hourly_files)} hours -> {n:,} rows ({size_mb:.1f} MB)")
+    print(f"  Merged {date_str}: +{len(hourly_files)} hours -> {n:,} rows ({size_mb:.1f} MB)")
     return n
 
 
@@ -238,21 +270,26 @@ def main():
     print(f"Already downloaded: {len(downloaded)}")
     print(f"Remaining: {len(to_process)}")
 
+    dl_cfg = cfg.get("download", {})
+    temp_dir = Path(dl_cfg.get("temp_dir", "/tmp/pmxt_ingestion"))
+    connections = dl_cfg.get("connections", 4)
+    hourly_dir = hourly_chunk_dir(cfg)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
     if not to_process:
         print("Nothing to download!")
+        # Still sweep any chunks stranded by an interrupted earlier run —
+        # they're already checkpointed as downloaded and would otherwise
+        # never make it into the daily files.
+        ob_dir = orderbook_dir(cfg)
+        for date_str in date_range(cfg):
+            merge_hourly_to_daily(hourly_dir, date_str, ob_dir)
         return
 
     # Step 3: Download, filter, checkpoint
     print("\n" + "=" * 60)
     print("Step 3: Downloading and filtering")
     print("=" * 60)
-
-    dl_cfg = cfg.get("download", {})
-    temp_dir = Path(dl_cfg.get("temp_dir", "/tmp/pmxt_ingestion"))
-    connections = dl_cfg.get("connections", 4)
-    hourly_dir = temp_dir / "hourly"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    hourly_dir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
     total_rows = 0
@@ -293,13 +330,15 @@ def main():
         cp["downloaded_hours"] = list(downloaded)
         save_checkpoint(cfg, cp)
 
-    # Step 4: Merge hourly chunks into daily files
+    # Step 4: Merge hourly chunks into daily files. Sweep the full configured
+    # range (not just days touched this run) so chunks stranded by an earlier
+    # interrupted run get merged too.
     print("\n" + "=" * 60)
     print("Step 4: Merging into daily files")
     print("=" * 60)
 
     ob_dir = orderbook_dir(cfg)
-    for date_str in sorted(days_touched):
+    for date_str in sorted(set(date_range(cfg)) | days_touched):
         merge_hourly_to_daily(hourly_dir, date_str, ob_dir)
 
     elapsed = time.time() - t0

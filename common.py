@@ -100,8 +100,14 @@ def load_checkpoint(cfg):
 
 
 def save_checkpoint(cfg, cp):
-    with open(checkpoint_path(cfg), "w") as f:
+    # Atomic write: the checkpoint is the resume source of truth and is
+    # written mid-job by both the CLI and the dashboard — a crash during a
+    # plain open(..., "w") would corrupt it.
+    p = checkpoint_path(cfg)
+    tmp = p.parent / (p.name + ".tmp")
+    with open(tmp, "w") as f:
         json.dump(cp, f, indent=2)
+    tmp.replace(p)
 
 
 # ---------------------------------------------------------------------------
@@ -119,8 +125,17 @@ def _raw_config():
 
 
 def snapshot_dest():
-    """Default path the markets snapshot is downloaded to (inside data_dir)."""
+    """Path the markets snapshot is downloaded to.
+
+    Honors the `markets_snapshot:` config override so that "refresh" updates
+    the snapshot actually in use; defaults to data_dir/polymarket_markets.parquet.
+    """
     cfg = _raw_config()
+    override = cfg.get("markets_snapshot")
+    if override:
+        p = Path(override).expanduser()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
     d = Path(__file__).parent / cfg.get("data_dir", "data")
     d.mkdir(parents=True, exist_ok=True)
     return d / "polymarket_markets.parquet"

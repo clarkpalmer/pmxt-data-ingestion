@@ -318,9 +318,9 @@
       <div class="legend" id="feed-legend" style="display:none">
         <span><span class="cell downloaded"></span>downloaded</span>
         <span><span class="cell available"></span>in archive, not downloaded</span>
-        <span><span class="cell missing"></span>missing from archive</span>
+        <span><span class="cell missing"></span>missing from archive (HEAD-verified)</span>
         <span><span class="cell pending"></span>not yet published</span>
-        <span><span class="cell unknown"></span>beyond scan depth</span>
+        <span><span class="cell unknown"></span>unverified / beyond scan depth</span>
       </div>
       <div class="missing-list" id="missing-list"></div>
     </div>
@@ -392,8 +392,10 @@
       <h2>Coverage Report</h2>
       <button class="secondary" onclick="loadReport()" style="margin-bottom:12px">Refresh Report</button>
       <div class="report-stats" id="report-summary"></div>
+      <div class="missing-list" id="report-corrupt"></div>
       <div class="scroll-x" id="report-types"></div>
       <div class="scroll-x" id="report-hours" style="margin-top:14px"></div>
+      <div class="hint">Trades and resolutions are fetched by <code>python enrich.py</code> (CLI step — not part of the dashboard download job).</div>
     </div>
 
     <!-- Files Panel -->
@@ -439,10 +441,10 @@ async function saveConfig() {
     return {asset: a.trim(), duration: (d || '5m').trim()};
   });
   const lines = s => document.getElementById(s).value.trim().split('\n').filter(Boolean);
+  // Only the fields this form edits — the server merges them into config.yaml
+  // and preserves everything else (archive_version, data_dir, download,
+  // markets_snapshot, ...).
   const cfg = {
-    archive_version: 'v2',
-    data_dir: 'data',
-    download: {connections: 4, temp_dir: '/tmp/pmxt_ingestion'},
     start_date: document.getElementById('cfg-start').value.trim(),
     end_date: document.getElementById('cfg-end').value.trim(),
   };
@@ -468,7 +470,8 @@ async function loadStatus() {
     document.getElementById('s-hours').textContent = s.hours_downloaded + '/' + s.hours_total;
     document.getElementById('s-rows').textContent = s.orderbook.total_rows.toLocaleString();
     document.getElementById('s-size').textContent = (s.orderbook.total_size_mb / 1000).toFixed(2) + ' GB';
-    document.getElementById('s-trades').textContent = s.trades ? s.trades.rows.toLocaleString() : '—';
+    document.getElementById('s-trades').textContent =
+      s.trades ? (s.trades.corrupt ? 'CORRUPT' : s.trades.rows.toLocaleString()) : '—';
 
     const tbody = document.getElementById('files-body');
     const maxRows = Math.max(...s.orderbook.files.map(f => f.rows || 0), 1);
@@ -505,9 +508,12 @@ async function loadArchive(force) {
   const meta = document.getElementById('feed-meta');
   if (force) meta.innerHTML = '<span class="feed-dot ok"></span>rescanning archive listing…';
   try {
-    const r = await fetch(API + '/api/archive');
+    const r = await fetch(API + '/api/archive' + (force ? '?force=1' : ''));
     const a = await r.json();
-    if (a.error) { meta.innerHTML = `<span class="feed-dot stale"></span>${a.error}`; return; }
+    if (a.error) { meta.innerHTML = `<span class="feed-dot stale"></span>${esc(a.error)}`; return; }
+    if (a.scan_failed) {
+      meta.innerHTML = '<span class="feed-dot stale"></span>archive listing unreachable — coverage shown as unknown, not missing';
+    }
 
     archiveLatestEnd = a.latest_end_ts;
     tickAge();
@@ -515,11 +521,13 @@ async function loadArchive(force) {
     document.getElementById('s-age').className = 'stat-value ' +
       (a.age_seconds < 2 * 3600 ? '' : a.age_seconds < 6 * 3600 ? 'amber' : 'red');
 
-    const state = a.age_seconds < 2 * 3600 ? 'ok' : a.age_seconds < 6 * 3600 ? 'warn' : 'stale';
-    meta.innerHTML = `
-      <span class="feed-dot ${state}"></span>latest file <b>${a.latest_file_hour || '?'}</b><br>
-      ${a.files_seen.toLocaleString()} files in listing scan${a.scan_truncated ? ' (scan depth reached)' : ''}<br>
-      listing cached ${fmtAge(a.cached_age_seconds)} ago`;
+    if (!a.scan_failed) {
+      const state = a.age_seconds < 2 * 3600 ? 'ok' : a.age_seconds < 6 * 3600 ? 'warn' : 'stale';
+      meta.innerHTML = `
+        <span class="feed-dot ${state}"></span>latest file <b>${a.latest_file_hour || '?'}</b><br>
+        ${a.files_seen.toLocaleString()} files in listing scan${a.scan_truncated ? ' (scan depth reached)' : ''}<br>
+        listing cached ${fmtAge(a.cached_age_seconds)} ago`;
+    }
 
     // hour grid grouped by date
     const byDate = {};
@@ -533,7 +541,7 @@ async function loadArchive(force) {
 
     const missing = a.missing || [];
     document.getElementById('missing-list').innerHTML = missing.length
-      ? `missing from archive: ` + missing.slice(0, 48).map(m => `<span class="chipm">${m}</span>`).join('')
+      ? `missing from archive: ` + missing.slice(0, 48).map(m => `<span class="chipm">${esc(m)}</span>`).join('')
         + (missing.length > 48 ? ` +${missing.length - 48} more` : '')
       : '';
   } catch(e) {
@@ -562,17 +570,23 @@ async function doSearch() {
     return;
   }
   empty.classList.add('hidden');
-  div.innerHTML = results.map(m => {
+  // Build DOM nodes (not an HTML string) so slugs/IDs never pass through a
+  // JS-string-in-onclick escaping context.
+  div.textContent = '';
+  results.forEach(m => {
+    const el = document.createElement('div');
+    el.className = 'search-result';
     let chips = '';
     if (m.resolved_outcome) chips += `<span class="chip res">→ ${esc(m.resolved_outcome)}</span>`;
     else if (m.status) chips += `<span class="chip live">${esc(m.status)}</span>`;
     chips += (m.tags || []).slice(0, 4).map(t => `<span class="chip">${esc(t)}</span>`).join('');
-    return `<div class="search-result" onclick="addFromSearch('${esc(m.slug)}','${esc(m.condition_id)}')">
+    el.innerHTML = `
       <div class="slug">${esc(m.slug)}</div>
       <div class="question">${esc(m.question)}</div>
-      <div>${chips}</div>
-    </div>`;
-  }).join('');
+      <div>${chips}</div>`;
+    el.addEventListener('click', () => addFromSearch(m.slug, m.condition_id));
+    div.appendChild(el);
+  });
 }
 
 function addFromSearch(slug, cid) {
@@ -655,8 +669,28 @@ async function startDownload() {
   btn.disabled = true;
   const r = await fetch(API + '/api/download', {method: 'POST'});
   const j = await r.json();
-  if (j.error) { flash(j.error, false); btn.disabled = false; return; }
-  pollInterval = setInterval(pollDownload, 1000);
+  if (j.error) {
+    flash(j.error, false);
+    // 409 = a job is already running (e.g. started before a page reload) —
+    // attach to it instead of dead-ending.
+    if (r.status === 409) { attachDownload(); return; }
+    btn.disabled = false;
+    return;
+  }
+  if (!pollInterval) pollInterval = setInterval(pollDownload, 1000);
+}
+
+// Re-attach to a job that's already running (page reload / second tab)
+async function attachDownload() {
+  try {
+    const r = await fetch(API + '/api/download/status');
+    const s = await r.json();
+    if (s.running && !pollInterval) {
+      document.getElementById('dl-btn').disabled = true;
+      pollInterval = setInterval(pollDownload, 1000);
+      pollDownload();
+    }
+  } catch (e) {}
 }
 
 async function pollDownload() {
@@ -675,6 +709,7 @@ async function pollDownload() {
 
   if (!s.running) {
     clearInterval(pollInterval);
+    pollInterval = null;
     document.getElementById('dl-btn').disabled = false;
     if (s.error) flash('Download error: ' + s.error, false);
     else if (s.done) flash('Download complete!', true);
@@ -690,6 +725,11 @@ async function loadReport() {
     const r = await fetch(API + '/api/report');
     const rpt = await r.json();
     if (rpt.error) { document.getElementById('report-summary').innerHTML = `<span class="hint">${esc(rpt.error)}</span>`; return; }
+
+    const corrupt = rpt.corrupt_files || [];
+    document.getElementById('report-corrupt').innerHTML = corrupt.length
+      ? 'corrupt files (excluded): ' + corrupt.map(f => `<span class="chipm">${esc(f)}</span>`).join('')
+      : '';
 
     const total = rpt.total_markets || 1;
     document.getElementById('report-summary').innerHTML = `
@@ -724,7 +764,7 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s || 
 
 function flash(msg, ok) {
   const el = document.getElementById('flash');
-  el.innerHTML = `<div class="flash ${ok ? 'flash-ok' : 'flash-err'}">${msg}</div>`;
+  el.innerHTML = `<div class="flash ${ok ? 'flash-ok' : 'flash-err'}">${esc(msg)}</div>`;
   setTimeout(() => el.innerHTML = '', 4000);
 }
 
@@ -734,6 +774,7 @@ loadStatus();
 loadReport();
 loadArchive();
 loadSnapshot();
+attachDownload();
 </script>
 </body>
 </html>

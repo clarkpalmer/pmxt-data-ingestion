@@ -8,12 +8,13 @@ Downloads hourly orderbook snapshots from the PMXT v2 archive, filters to only t
 
 | Asset | Durations | Slug Pattern |
 |-------|-----------|-------------|
-| BTC | 5m, 15m | `btc-updown-{duration}-{timestamp}` |
-| ETH | 5m | `eth-updown-5m-{timestamp}` |
-| SOL | 5m | `sol-updown-5m-{timestamp}` |
-| XRP | 5m | `xrp-updown-5m-{timestamp}` |
+| BTC | 5m, 15m, 4h | `btc-updown-{duration}-{timestamp}` |
+| ETH | 5m, 15m, 4h | `eth-updown-{duration}-{timestamp}` |
+| SOL | 5m, 15m, 4h | `sol-updown-{duration}-{timestamp}` |
+| XRP | 5m, 15m, 4h | `xrp-updown-{duration}-{timestamp}` |
+| DOGE / BNB / HYPE | 5m | `{asset}-updown-5m-{timestamp}` |
 
-More assets/durations may exist — just add them to config.yaml and the script will try to discover them.
+(Verified against live Gamma discovery, June 2026.) More assets/durations may exist — just add them to config.yaml and the script will try to discover them.
 
 ## Quick Start
 

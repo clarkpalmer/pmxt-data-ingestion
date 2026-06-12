@@ -84,12 +84,34 @@ def get_config():
         return jsonify({"error": str(e)}), 500
 
 
+# The dashboard form edits only dates + market selectors. Everything else in
+# config.yaml (archive_version, data_dir, download settings, markets_snapshot,
+# any user-added keys) is preserved verbatim — the form must never clobber
+# configuration it doesn't display.
 @app.route("/api/config", methods=["POST"])
 def save_config():
     try:
-        cfg = request.json
-        with open(CONFIG_FILE, "w") as f:
+        posted = request.json or {}
+        try:
+            with open(CONFIG_FILE) as f:
+                cfg = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            cfg = {}
+        for key in ("start_date", "end_date"):
+            if posted.get(key):
+                cfg[key] = posted[key]
+        for key in ("markets", "slugs", "condition_ids", "event_ids", "tags"):
+            if posted.get(key):
+                cfg[key] = posted[key]
+            else:
+                # Selector cleared in the form -> remove it
+                cfg.pop(key, None)
+        tmp = CONFIG_FILE.parent / (CONFIG_FILE.name + ".tmp")
+        with open(tmp, "w") as f:
             yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+        tmp.replace(CONFIG_FILE)
+        # Date range may have changed — the archive scan is range-dependent
+        _archive_cache["urls"] = None
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -106,8 +128,15 @@ def get_status():
 
     cp = load_checkpoint(cfg)
     cids = cp.get("discovered_cids", {})
-    downloaded = set(cp.get("downloaded_hours", []))
     target_hours = hour_range(cfg)
+    # The checkpoint accumulates hours across every range ever downloaded;
+    # the headline stat must count only hours inside the CURRENT range.
+    target_set = set(target_hours)
+    downloaded = set()
+    for fname in cp.get("downloaded_hours", []):
+        m = re.search(r"(\d{4}-\d{2}-\d{2})T(\d{2})", str(fname))
+        if m and (m.group(1), m.group(2)) in target_set:
+            downloaded.add((m.group(1), m.group(2)))
 
     ob_dir = orderbook_dir(cfg)
     ob_files = sorted(ob_dir.glob("orderbook_*.parquet"))
@@ -131,21 +160,30 @@ def get_status():
         })
     con.close()
 
+    # Same corrupt-file tolerance as the orderbook files: a truncated
+    # trades/resolutions parquet must flag, not 500 the whole page.
     t_file = trades_dir(cfg) / "trades.parquet"
     trades_info = None
     if t_file.exists():
-        con = duckdb.connect()
-        tn = con.execute(f"SELECT COUNT(*) FROM read_parquet('{t_file}')").fetchone()[0]
-        con.close()
-        trades_info = {"rows": tn, "size_mb": round(t_file.stat().st_size / 1e6, 1)}
+        try:
+            con = duckdb.connect()
+            tn = con.execute(f"SELECT COUNT(*) FROM read_parquet('{t_file}')").fetchone()[0]
+            con.close()
+            trades_info = {"rows": tn, "size_mb": round(t_file.stat().st_size / 1e6, 1)}
+        except Exception:
+            trades_info = {"rows": None, "corrupt": True,
+                           "size_mb": round(t_file.stat().st_size / 1e6, 1)}
 
     r_file = data_dir(cfg) / "resolutions.parquet"
     res_info = None
     if r_file.exists():
-        con = duckdb.connect()
-        rn = con.execute(f"SELECT COUNT(*) FROM read_parquet('{r_file}')").fetchone()[0]
-        con.close()
-        res_info = {"rows": rn}
+        try:
+            con = duckdb.connect()
+            rn = con.execute(f"SELECT COUNT(*) FROM read_parquet('{r_file}')").fetchone()[0]
+            con.close()
+            res_info = {"rows": rn}
+        except Exception:
+            res_info = {"rows": None, "corrupt": True}
 
     return jsonify({
         "config": {
@@ -340,7 +378,7 @@ def market_lookup(key):
 
 _archive_cache = {
     "fetched_at": 0.0, "urls": None, "truncated": False, "oldest_scanned": None,
-    "head_checked": {},
+    "scan_failed": False, "head_checked": {},
 }
 _ARCHIVE_CACHE_TTL = 300
 _ARCHIVE_MAX_PAGES = 60
@@ -350,40 +388,51 @@ _HEAD_CHECK_CAP = 30
 def _verify_missing_hours(cfg, urls, keys):
     """The archive listing returns inconsistent pages between scans, so a key
     absent from the listing is not necessarily absent from the archive.
-    HEAD-check the predicted file URL for each candidate; return the set of
-    keys that actually exist. Results are cached for the TTL window.
+    HEAD-check the predicted file URL for each candidate.
+
+    Returns (exists, verified): keys confirmed to exist, and the set of keys
+    actually checked this TTL window. Candidates we never got to (beyond the
+    per-call cap) must NOT be labeled missing — the caller renders them as
+    unverified. Already-checked keys don't consume cap budget, so successive
+    polls advance through the candidate list.
     """
     if not urls:
-        return set()
+        return set(), set()
     sample = next(iter(urls))
     if not re.search(r"\d{4}-\d{2}-\d{2}T\d{2}", sample):
-        return set()
+        return set(), set()
     ep = archive_endpoints(cfg)
     session = requests.Session()
-    exists = set()
     checked = _archive_cache["head_checked"]
-    for key in list(keys)[:_HEAD_CHECK_CAP]:
-        if key in checked:
-            if checked[key]:
-                exists.add(key)
-            continue
+    exists = {k for k in keys if checked.get(k)}
+    verified = {k for k in keys if k in checked}
+    unchecked = [k for k in keys if k not in checked]
+    for key in unchecked[:_HEAD_CHECK_CAP]:
         fname = re.sub(r"\d{4}-\d{2}-\d{2}T\d{2}", f"{key[0]}T{key[1]}", sample)
         try:
             resp = session.head(f"{ep['download']}/{fname}", timeout=10, allow_redirects=True)
-            ok = resp.status_code == 200
+            # Only a definitive 404/410 proves absence; transient errors stay unverified
+            if resp.status_code == 200:
+                checked[key] = True
+            elif resp.status_code in (404, 410):
+                checked[key] = False
+            else:
+                continue
         except Exception:
-            ok = False
-        checked[key] = ok
-        if ok:
+            continue
+        verified.add(key)
+        if checked[key]:
             exists.add(key)
-    return exists
+    return exists, verified
 
 
 def _scan_archive(cfg, oldest_needed):
     """Page through the archive listing (newest-first) until we have covered
     oldest_needed, the listing is exhausted, or the page cap is hit.
 
-    Returns (urls, truncated, oldest_scanned).
+    Returns (urls, truncated, oldest_scanned, failed). failed=True means the
+    scan produced nothing because of network errors — which must render as
+    "couldn't scan", never as "everything is missing from the archive".
     """
     ep = archive_endpoints(cfg)
     session = requests.Session()
@@ -391,12 +440,14 @@ def _scan_archive(cfg, oldest_needed):
     oldest_scanned = None
     consecutive_empty = 0
     truncated = True
+    errors = 0
     for page in range(1, _ARCHIVE_MAX_PAGES + 1):
         try:
             u = ep["archive"] if page == 1 else f"{ep['archive']}?page={page}"
             resp = session.get(u, timeout=30)
             found = set(re.findall(ep["url_pattern"], resp.text))
         except Exception:
+            errors += 1
             found = set()
         if not found:
             consecutive_empty += 1
@@ -416,7 +467,8 @@ def _scan_archive(cfg, oldest_needed):
         if oldest_needed and oldest_scanned and oldest_scanned <= oldest_needed:
             truncated = False  # covered everything we need
             break
-    return urls, truncated, oldest_scanned
+    failed = not urls and errors > 0
+    return urls, truncated, oldest_scanned, failed
 
 
 @app.route("/api/archive")
@@ -430,15 +482,18 @@ def archive_status():
     oldest_needed = min(target) if target else None
 
     now = time.time()
-    if _archive_cache["urls"] is None or now - _archive_cache["fetched_at"] > _ARCHIVE_CACHE_TTL:
-        urls, truncated, oldest_scanned = _scan_archive(cfg, oldest_needed)
+    force = request.args.get("force") in ("1", "true")
+    if (force or _archive_cache["urls"] is None
+            or now - _archive_cache["fetched_at"] > _ARCHIVE_CACHE_TTL):
+        urls, truncated, oldest_scanned, failed = _scan_archive(cfg, oldest_needed)
         _archive_cache.update(
             fetched_at=now, urls=urls, truncated=truncated, oldest_scanned=oldest_scanned,
-            head_checked={},
+            scan_failed=failed, head_checked={},
         )
     urls = _archive_cache["urls"]
     truncated = _archive_cache["truncated"]
     oldest_scanned = _archive_cache["oldest_scanned"]
+    scan_failed = _archive_cache.get("scan_failed", False)
 
     available = set()
     latest = None
@@ -459,16 +514,19 @@ def archive_status():
 
     # Per-hour state within the configured range:
     #   downloaded > available > pending (newer than latest archive file)
-    #   > unknown (older than our truncated scan) > missing (archive gap)
-    # Listing pages are inconsistent between scans, so candidates for
-    # "missing" are HEAD-verified against the predicted file URL first.
+    #   > unknown (older than our truncated scan, scan failure, or not yet
+    #     HEAD-verified) > missing (HEAD-verified archive gap)
+    # Listing pages are inconsistent between scans, so a key may only render
+    # as "missing" after a definitive HEAD 404 on its predicted file URL.
     candidates = set()
-    for key in target:
-        if (key not in downloaded and key not in available
-                and not (latest and key > latest)
-                and not (truncated and oldest_scanned and key < oldest_scanned)):
-            candidates.add(key)
-    available |= _verify_missing_hours(cfg, urls, sorted(candidates))
+    if not scan_failed:
+        for key in target:
+            if (key not in downloaded and key not in available
+                    and not (latest and key > latest)
+                    and not (truncated and oldest_scanned and key < oldest_scanned)):
+                candidates.add(key)
+    exists, verified = _verify_missing_hours(cfg, urls, sorted(candidates))
+    available |= exists
 
     hours = []
     for key in target:
@@ -479,10 +537,10 @@ def archive_status():
             state = "available"
         elif latest and key > latest:
             state = "pending"
-        elif truncated and oldest_scanned and key < oldest_scanned:
-            state = "unknown"
-        else:
+        elif key in candidates and key in verified:
             state = "missing"
+        else:
+            state = "unknown"
         hours.append({"date": d, "hour": h, "state": state})
 
     latest_str = None
@@ -501,6 +559,7 @@ def archive_status():
         "age_seconds": (int(now) - latest_end_ts) if latest_end_ts else None,
         "files_seen": len(urls),
         "scan_truncated": truncated,
+        "scan_failed": scan_failed,
         "hours": hours,
         "missing": [f"{d}T{h}" for d, h, in
                     [(x["date"], x["hour"]) for x in hours if x["state"] == "missing"]],
@@ -545,6 +604,7 @@ def _run_download():
         # Phase 1: Discover condition IDs
         _job["phase"] = "discovering"
         _log("Discovering condition IDs...")
+        prev_cids = set(cp.get("discovered_cids", {}).values())
         cids = discover_condition_ids(cfg, progress=False)
         cp["discovered_cids"] = cids
         save_checkpoint(cfg, cp)
@@ -556,6 +616,14 @@ def _run_download():
         if not cid_set:
             _job["error"] = "No condition IDs found"
             return
+
+        # Hours already checkpointed were filtered with the OLD condition-ID
+        # set — new markets get no data for those hours unless re-downloaded.
+        if prev_cids and (cid_set - prev_cids) and cp.get("downloaded_hours"):
+            _log(f"WARNING: {len(cid_set - prev_cids)} new condition IDs since the "
+                 f"last download — already-downloaded hours were filtered without "
+                 f"them and will NOT be re-fetched. Delete data/checkpoint.json "
+                 f"(downloaded_hours) to re-download those hours for the new markets.")
 
         # Phase 2: Get archive file list
         _job["phase"] = "listing"
@@ -577,8 +645,17 @@ def _run_download():
 
         _log(f"Archive files to download: {len(to_process)}")
 
+        from download import (download_file, filter_parquet,
+                              hourly_chunk_dir, merge_hourly_to_daily)
+        ob_dir = orderbook_dir(cfg)
+        hourly_dir = hourly_chunk_dir(cfg)
+
         if not to_process:
             _log("Nothing to download!")
+            # Sweep chunks stranded by an interrupted earlier run — they're
+            # checkpointed as downloaded and would otherwise never be merged.
+            for date_str in date_range(cfg):
+                merge_hourly_to_daily(hourly_dir, date_str, ob_dir)
             _job["phase"] = "done"
             _job["done"] = True
             return
@@ -589,9 +666,6 @@ def _run_download():
         temp_dir = Path(cfg.get("download", {}).get("temp_dir", "/tmp/pmxt_ingestion"))
         temp_dir.mkdir(parents=True, exist_ok=True)
         connections = cfg.get("download", {}).get("connections", 4)
-        ob_dir = orderbook_dir(cfg)
-        hourly_dir = ob_dir / "hourly"
-        hourly_dir.mkdir(parents=True, exist_ok=True)
 
         total_rows = 0
         for i, (fname, url, date_str, hour_str) in enumerate(to_process):
@@ -599,27 +673,30 @@ def _run_download():
             _log(f"[{i+1}/{len(to_process)}] {fname}")
 
             raw_file = temp_dir / fname
-            from download import download_file, filter_parquet
-            ok = download_file(url, raw_file, connections)
-            if not ok:
-                _log(f"  DOWNLOAD FAILED")
+            try:
+                ok = download_file(url, raw_file, connections)
+                if not ok:
+                    _log("  DOWNLOAD FAILED")
+                    continue
+
+                out_file = hourly_dir / f"chunk_{date_str}_T{hour_str}.parquet"
+                n = filter_parquet(raw_file, cid_set, out_file)
+                total_rows += n
+                _log(f"  -> {n:,} rows")
+            except Exception as e:
+                # One bad archive file must not abort the whole job
+                _log(f"  ERROR: {e}")
                 continue
-
-            out_file = hourly_dir / f"chunk_{date_str}_T{hour_str}.parquet"
-            n = filter_parquet(raw_file, cid_set, out_file)
-            raw_file.unlink(missing_ok=True)
-            total_rows += n
-
-            size_mb = raw_file.stat().st_size / 1e6 if raw_file.exists() else 0
-            _log(f"  -> {n:,} rows")
+            finally:
+                raw_file.unlink(missing_ok=True)
 
             cp.setdefault("downloaded_hours", []).append(fname)
             save_checkpoint(cfg, cp)
 
-        # Phase 4: Merge
+        # Phase 4: Merge (full configured range, so stranded chunks from
+        # earlier interrupted runs are swept in too)
         _job["phase"] = "merging"
         _log("Merging into daily files...")
-        from download import merge_hourly_to_daily
         for date_str in date_range(cfg):
             merge_hourly_to_daily(hourly_dir, date_str, ob_dir)
 
@@ -679,18 +756,24 @@ def get_report():
     trade_cids = set()
     t_file = trades_dir(cfg) / "trades.parquet"
     if t_file.exists():
-        for row in con.execute(f"""
-            SELECT DISTINCT condition_id FROM read_parquet('{t_file}')
-        """).fetchall():
-            trade_cids.add(row[0])
+        try:
+            for row in con.execute(f"""
+                SELECT DISTINCT condition_id FROM read_parquet('{t_file}')
+            """).fetchall():
+                trade_cids.add(row[0])
+        except Exception:
+            corrupt_files.append(t_file)
 
     res_cids = set()
     r_file = data_dir(cfg) / "resolutions.parquet"
     if r_file.exists():
-        for row in con.execute(f"""
-            SELECT DISTINCT condition_id FROM read_parquet('{r_file}')
-        """).fetchall():
-            res_cids.add(row[0])
+        try:
+            for row in con.execute(f"""
+                SELECT DISTINCT condition_id FROM read_parquet('{r_file}')
+            """).fetchall():
+                res_cids.add(row[0])
+        except Exception:
+            corrupt_files.append(r_file)
 
     con.close()
 
@@ -719,9 +802,12 @@ def get_report():
         if cid in has_all:
             type_stats[mtype]["all"] += 1
 
-    # Hourly coverage
+    # Hourly coverage (updown slugs only — their last token is a timestamp;
+    # arbitrary slugs ending in a number would mis-bucket)
     hourly = {}
     for slug, cid in cids.items():
+        if "updown" not in slug:
+            continue
         try:
             ts = int(slug.rsplit("-", 1)[1])
             hour = datetime.fromtimestamp(ts, tz=timezone.utc).hour
