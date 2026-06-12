@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PMXT Ingest — Polymarket Data Console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230b0f0e'/%3E%3Crect x='2' y='8' width='3' height='6' fill='%2355e6a5'/%3E%3Crect x='6.5' y='4' width='3' height='10' fill='%2355e6a5' opacity='0.7'/%3E%3Crect x='11' y='6' width='3' height='8' fill='%2355e6a5' opacity='0.45'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,300..800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #0b0f0e;
+    --panel: #101614;
+    --panel-2: #0d1211;
+    --line: #1e2a26;
+    --line-soft: #16201d;
+    --text: #d9e6e0;
+    --muted: #7a8d86;
+    --faint: #4a5a54;
+    --phos: #55e6a5;
+    --phos-dim: rgba(85, 230, 165, 0.14);
+    --phos-glow: rgba(85, 230, 165, 0.35);
+    --amber: #f4b95e;
+    --amber-dim: rgba(244, 185, 94, 0.14);
+    --red: #ff6b5e;
+    --red-dim: rgba(255, 107, 94, 0.12);
+    --radius: 4px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { background: var(--ink); }
+
+  body {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 13px;
+    background:
+      radial-gradient(1200px 600px at 70% -10%, rgba(85, 230, 165, 0.05), transparent 60%),
+      var(--ink);
+    color: var(--text);
+    min-height: 100vh;
+  }
+
+  /* scanline + vignette atmosphere */
+  body::before {
+    content: "";
+    position: fixed; inset: 0;
+    background: repeating-linear-gradient(
+      to bottom, transparent 0 2px, rgba(0, 0, 0, 0.16) 2px 3px);
+    pointer-events: none; z-index: 999; opacity: 0.5;
+  }
+  body::after {
+    content: "";
+    position: fixed; inset: 0;
+    background: radial-gradient(ellipse at 50% 40%, transparent 55%, rgba(0,0,0,0.5));
+    pointer-events: none; z-index: 998;
+  }
+
+  .container { max-width: 1180px; margin: 0 auto; padding: 28px 20px 64px; }
+
+  /* ---------- header ---------- */
+  header {
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    border-bottom: 1px solid var(--line); padding-bottom: 14px; margin-bottom: 18px;
+  }
+  .wordmark {
+    font-family: 'Bricolage Grotesque', sans-serif;
+    font-size: clamp(1.5rem, 3.5vw, 2.1rem); font-weight: 750; letter-spacing: -0.02em;
+    color: var(--text);
+  }
+  .wordmark em { font-style: normal; color: var(--phos); }
+  .wordmark .slash { color: var(--faint); font-weight: 300; }
+  .tagline { color: var(--muted); font-size: 0.78rem; letter-spacing: 0.04em; }
+  .utc-clock { margin-left: auto; color: var(--faint); font-size: 0.75rem; letter-spacing: 0.08em; }
+  .utc-clock b { color: var(--muted); font-weight: 500; }
+
+  /* ---------- cards & reveal ---------- */
+  .card {
+    background: linear-gradient(180deg, var(--panel), var(--panel-2));
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 18px;
+    animation: rise 0.5s cubic-bezier(0.2, 0.7, 0.3, 1) both;
+  }
+  .card:nth-of-type(1) { animation-delay: 0.03s; }
+  .grid > .card:nth-child(1) { animation-delay: 0.10s; }
+  .grid > .card:nth-child(2) { animation-delay: 0.16s; }
+  .grid > .card:nth-child(3) { animation-delay: 0.22s; }
+  .grid > .card:nth-child(4) { animation-delay: 0.28s; }
+  .grid > .card:nth-child(5) { animation-delay: 0.34s; }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { .card, .bar i, .feed-dot { animation: none !important; transition: none !important; } }
+
+  h2 {
+    font-family: 'Bricolage Grotesque', sans-serif;
+    font-size: 0.95rem; font-weight: 650; letter-spacing: 0.10em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 14px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  h2::before { content: "▞"; color: var(--phos); font-size: 0.8rem; }
+
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+  .card-full { grid-column: 1 / -1; }
+  @media (max-width: 920px) { .grid { grid-template-columns: 1fr; } }
+
+  /* ---------- stat rail ---------- */
+  .rail {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 1px; background: var(--line); border: 1px solid var(--line);
+    border-radius: var(--radius); overflow: hidden;
+  }
+  .stat { background: var(--panel); padding: 14px 16px; }
+  .stat-value {
+    font-size: 1.35rem; font-weight: 600; color: var(--phos);
+    font-variant-numeric: tabular-nums; letter-spacing: -0.01em; line-height: 1.2;
+  }
+  .stat-value.amber { color: var(--amber); }
+  .stat-value.red { color: var(--red); }
+  .stat-value small { font-size: 0.7rem; color: var(--muted); font-weight: 400; margin-left: 2px; }
+  .stat-label {
+    font-size: 0.66rem; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.12em; margin-top: 4px;
+  }
+
+  /* ---------- forms ---------- */
+  label {
+    display: block; font-size: 0.68rem; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.1em; margin: 12px 0 5px;
+  }
+  label:first-of-type { margin-top: 0; }
+  input, textarea {
+    background: var(--ink); border: 1px solid var(--line); color: var(--text);
+    padding: 9px 11px; border-radius: var(--radius); width: 100%;
+    font-size: 0.82rem; font-family: inherit;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  input:focus, textarea:focus {
+    border-color: var(--phos); outline: none;
+    box-shadow: 0 0 0 3px var(--phos-dim);
+  }
+  textarea { resize: vertical; min-height: 56px; line-height: 1.5; }
+  ::placeholder { color: var(--faint); }
+
+  button {
+    background: var(--phos); color: #07120d; border: 1px solid var(--phos);
+    padding: 9px 18px; border-radius: var(--radius); cursor: pointer;
+    font-size: 0.78rem; font-weight: 600; font-family: inherit;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    transition: box-shadow 0.15s, transform 0.1s;
+  }
+  button:hover { box-shadow: 0 0 18px var(--phos-glow); }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: 0.35; cursor: not-allowed; box-shadow: none; }
+  button.secondary { background: transparent; color: var(--muted); border-color: var(--line); }
+  button.secondary:hover { color: var(--text); border-color: var(--muted); box-shadow: none; }
+
+  .row { display: flex; gap: 10px; }
+  .row > * { flex: 1; }
+  .btn-row { display: flex; gap: 8px; margin-top: 14px; }
+
+  /* ---------- archive feed ---------- */
+  .feed-head { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .feed-age {
+    font-size: 1.9rem; font-weight: 600; font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em; line-height: 1;
+  }
+  .feed-age.ok { color: var(--phos); text-shadow: 0 0 24px var(--phos-glow); }
+  .feed-age.warn { color: var(--amber); }
+  .feed-age.stale { color: var(--red); }
+  .feed-meta { color: var(--muted); font-size: 0.74rem; line-height: 1.7; min-width: 0; overflow-wrap: anywhere; }
+  @media (max-width: 480px) {
+    .card { padding: 14px; }
+    .feed-age { font-size: 1.45rem; }
+    .hour-date { width: 70px; }
+  }
+  .feed-meta b { color: var(--text); font-weight: 500; }
+  .feed-dot {
+    width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 6px;
+  }
+  .feed-dot.ok { background: var(--phos); animation: pulse 2s infinite; }
+  .feed-dot.warn { background: var(--amber); }
+  .feed-dot.stale { background: var(--red); animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+  .hour-grid { margin-top: 16px; display: flex; flex-direction: column; gap: 5px; }
+  .hour-row { display: flex; align-items: center; gap: 8px; }
+  .hour-date { width: 86px; flex: none; color: var(--muted); font-size: 0.7rem; }
+  .hour-cells { display: flex; flex-wrap: wrap; gap: 3px; }
+  .cell {
+    width: 15px; height: 15px; border-radius: 2px; flex: none;
+    background: var(--line-soft); border: 1px solid transparent;
+    transition: transform 0.1s;
+  }
+  .cell:hover { transform: scale(1.35); z-index: 2; }
+  .cell.downloaded { background: var(--phos); box-shadow: 0 0 6px var(--phos-glow); }
+  .cell.available { background: var(--phos-dim); border-color: var(--phos); }
+  .cell.missing { background: var(--red-dim); border-color: var(--red); }
+  .cell.pending { background: var(--line-soft); }
+  .cell.unknown { background: var(--amber-dim); border-color: var(--amber); opacity: 0.6; }
+
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; font-size: 0.68rem; color: var(--muted); }
+  .legend span { display: flex; align-items: center; gap: 5px; }
+  .legend .cell { width: 11px; height: 11px; }
+  .legend .cell:hover { transform: none; }
+
+  .missing-list { margin-top: 10px; font-size: 0.72rem; color: var(--red); line-height: 1.8; }
+  .missing-list .chipm {
+    display: inline-block; background: var(--red-dim); border: 1px solid var(--red);
+    border-radius: 2px; padding: 1px 7px; margin: 2px 3px 2px 0;
+  }
+
+  /* ---------- search ---------- */
+  .search-results { max-height: 300px; overflow-y: auto; margin-top: 10px; }
+  .search-result {
+    padding: 9px 10px; border-left: 2px solid transparent;
+    border-bottom: 1px solid var(--line-soft); cursor: pointer;
+    transition: background 0.1s, border-color 0.1s;
+  }
+  .search-result:hover { background: var(--phos-dim); border-left-color: var(--phos); }
+  .search-result .slug { color: var(--phos); font-size: 0.78rem; word-break: break-all; }
+  .search-result .question { color: var(--muted); font-size: 0.72rem; margin-top: 2px; }
+  .chip {
+    display: inline-block; background: var(--ink); border: 1px solid var(--line);
+    border-radius: 2px; padding: 1px 7px; font-size: 0.66rem; margin: 3px 3px 0 0;
+    color: var(--muted);
+  }
+  .chip.res { color: var(--phos); border-color: var(--phos); background: var(--phos-dim); }
+  .chip.live { color: var(--amber); border-color: var(--amber); background: var(--amber-dim); }
+
+  /* ---------- download ---------- */
+  .progress-bar {
+    background: var(--ink); border: 1px solid var(--line); border-radius: var(--radius);
+    height: 22px; overflow: hidden; margin: 12px 0;
+  }
+  .progress-fill {
+    background: linear-gradient(90deg, rgba(85,230,165,0.6), var(--phos));
+    height: 100%; transition: width 0.4s; min-width: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.68rem; font-weight: 600; color: #07120d;
+  }
+  .log {
+    background: var(--ink); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 12px; max-height: 280px; overflow-y: auto;
+    font-size: 0.72rem; line-height: 1.7; color: var(--muted);
+  }
+  .log .line { white-space: pre-wrap; }
+  .log .line::before { content: "▸ "; color: var(--faint); }
+
+  /* ---------- tables ---------- */
+  .scroll-x { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.76rem; min-width: 480px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line-soft); white-space: nowrap; }
+  td { font-variant-numeric: tabular-nums; }
+  th {
+    color: var(--faint); font-weight: 500; text-transform: uppercase;
+    letter-spacing: 0.1em; font-size: 0.64rem;
+  }
+  tr:hover td { background: rgba(85, 230, 165, 0.03); }
+  .bar-cell { width: 140px; }
+  .bar { height: 12px; background: var(--line-soft); border-radius: 2px; overflow: hidden; }
+  .bar i {
+    display: block; height: 100%; background: var(--phos); opacity: 0.75;
+    transform-origin: left; animation: grow 0.7s cubic-bezier(0.2, 0.7, 0.3, 1) both;
+  }
+  .bar i.green { background: var(--phos); }
+  @keyframes grow { from { transform: scaleX(0); } }
+  .corrupt-tag { color: var(--red); font-weight: 600; letter-spacing: 0.08em; }
+
+  .report-stats { display: flex; gap: 26px; flex-wrap: wrap; margin-bottom: 14px; }
+  .report-stats .stat { background: none; padding: 0; }
+
+  /* ---------- flash ---------- */
+  .flash {
+    padding: 10px 14px; border-radius: var(--radius); font-size: 0.78rem;
+    margin-bottom: 12px; animation: rise 0.3s both;
+  }
+  .flash-ok { background: var(--phos-dim); border: 1px solid var(--phos); color: var(--phos); }
+  .flash-err { background: var(--red-dim); border: 1px solid var(--red); color: var(--red); }
+
+  .hint { color: var(--faint); font-size: 0.7rem; margin-top: 8px; line-height: 1.6; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="wordmark">PMXT<span class="slash">//</span><em>INGEST</em></div>
+    <div class="tagline">Polymarket orderbook data console</div>
+    <div class="utc-clock"><b id="utc-now">--:--:--</b> UTC</div>
+  </header>
+
+  <div id="flash"></div>
+
+  <!-- Status rail -->
+  <div class="rail card" style="padding:0">
+    <div class="stat"><div class="stat-value" id="s-age">—</div><div class="stat-label">Archive Age</div></div>
+    <div class="stat"><div class="stat-value" id="s-cids">—</div><div class="stat-label">Condition IDs</div></div>
+    <div class="stat"><div class="stat-value" id="s-hours">—</div><div class="stat-label">Hours Downloaded</div></div>
+    <div class="stat"><div class="stat-value" id="s-rows">—</div><div class="stat-label">Orderbook Rows</div></div>
+    <div class="stat"><div class="stat-value" id="s-size">—</div><div class="stat-label">On Disk</div></div>
+    <div class="stat"><div class="stat-value" id="s-trades">—</div><div class="stat-label">Trades</div></div>
+  </div>
+
+  <div class="grid">
+    <!-- Archive feed -->
+    <div class="card card-full">
+      <h2>Archive Feed</h2>
+      <div class="feed-head">
+        <div>
+          <div class="feed-age" id="feed-age">scanning…</div>
+          <div class="hint">since last published archive hour</div>
+        </div>
+        <div class="feed-meta" id="feed-meta"><span class="feed-dot ok"></span>probing archive listing…</div>
+        <div style="margin-left:auto"><button class="secondary" onclick="loadArchive(true)">Rescan</button></div>
+      </div>
+      <div class="hour-grid" id="hour-grid"></div>
+      <div class="legend" id="feed-legend" style="display:none">
+        <span><span class="cell downloaded"></span>downloaded</span>
+        <span><span class="cell available"></span>in archive, not downloaded</span>
+        <span><span class="cell missing"></span>missing from archive (HEAD-verified)</span>
+        <span><span class="cell pending"></span>not yet published</span>
+        <span><span class="cell unknown"></span>unverified / beyond scan depth</span>
+      </div>
+      <div class="missing-list" id="missing-list"></div>
+    </div>
+
+    <!-- Config Panel -->
+    <div class="card">
+      <h2>Configuration</h2>
+      <div class="row">
+        <div><label>Start Date</label><input type="text" id="cfg-start" placeholder="2026-06-05 or 2026-06-05T06"></div>
+        <div><label>End Date</label><input type="text" id="cfg-end" placeholder="2026-06-05 or 2026-06-05T10"></div>
+      </div>
+
+      <label>Updown Markets (asset:duration, one per line)</label>
+      <textarea id="cfg-markets" rows="3" placeholder="btc:5m&#10;eth:5m&#10;sol:15m"></textarea>
+
+      <label>Slugs (one per line)</label>
+      <textarea id="cfg-slugs" rows="2" placeholder="will-bitcoin-reach-122k-september-15-21"></textarea>
+
+      <label>Condition IDs (one per line)</label>
+      <textarea id="cfg-cids" rows="2" placeholder="0x94b3610eec..."></textarea>
+
+      <label>Event IDs (one per line)</label>
+      <textarea id="cfg-events" rows="2" placeholder="196660"></textarea>
+
+      <label>Tags (one per line)</label>
+      <textarea id="cfg-tags" rows="2" placeholder="crypto&#10;esports"></textarea>
+
+      <div class="btn-row">
+        <button onclick="saveConfig()">Save Config</button>
+        <button class="secondary" onclick="loadConfig()">Reset</button>
+      </div>
+    </div>
+
+    <!-- Search Panel -->
+    <div class="card">
+      <h2>Search Markets</h2>
+      <input type="text" id="search-input" placeholder="Search by slug, title, condition ID…" oninput="debounceSearch()">
+      <div class="hint">Searches the local markets snapshot (falls back to Gamma API by exact slug). Click a result to add it to your slugs.</div>
+      <div id="search-results" class="search-results"></div>
+      <div id="search-empty" class="hidden hint">No results</div>
+    </div>
+
+    <!-- Markets Snapshot Panel -->
+    <div class="card card-full">
+      <h2>Markets Snapshot</h2>
+      <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+        <div class="feed-meta" id="snap-meta"><span class="feed-dot warn"></span>checking…</div>
+        <div style="margin-left:auto"><button id="snap-btn" onclick="startSnapshot()" disabled>…</button></div>
+      </div>
+      <div class="progress-bar hidden" id="snap-bar-wrap"><div class="progress-fill" id="snap-progress" style="width:0%"></div></div>
+      <div class="hint">The full Polymarket markets dataset (1.28M+ markets: slugs, condition IDs, questions,
+        resolutions, tags, coverage dates) served free by Telonex — no API key. Powers instant search above,
+        offline condition-ID resolution during downloads, and <code>python snapshot.py --lookup</code>.</div>
+    </div>
+
+    <!-- Download Panel -->
+    <div class="card card-full">
+      <h2>Download</h2>
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <button id="dl-btn" onclick="startDownload()">Start Download</button>
+        <span id="dl-phase" class="hint" style="margin:0"></span>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" id="dl-progress" style="width:0%"></div></div>
+      <div class="log" id="dl-log"></div>
+    </div>
+
+    <!-- Report Panel -->
+    <div class="card card-full">
+      <h2>Coverage Report</h2>
+      <button class="secondary" onclick="loadReport()" style="margin-bottom:12px">Refresh Report</button>
+      <div class="report-stats" id="report-summary"></div>
+      <div class="missing-list" id="report-corrupt"></div>
+      <div class="scroll-x" id="report-types"></div>
+      <div class="scroll-x" id="report-hours" style="margin-top:14px"></div>
+      <div class="hint">Trades and resolutions are fetched by <code>python enrich.py</code> (CLI step — not part of the dashboard download job).</div>
+    </div>
+
+    <!-- Files Panel -->
+    <div class="card card-full">
+      <h2>Data Files</h2>
+      <div class="scroll-x">
+        <table id="files-table">
+          <thead><tr><th>File</th><th>Rows</th><th>Size</th><th>Visual</th></tr></thead>
+          <tbody id="files-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let searchTimeout = null;
+
+// --- UTC clock ---
+function tickClock() {
+  document.getElementById('utc-now').textContent =
+    new Date().toISOString().slice(11, 19);
+}
+setInterval(tickClock, 1000); tickClock();
+
+// --- Config ---
+async function loadConfig() {
+  const r = await fetch(API + '/api/config');
+  const cfg = await r.json();
+  document.getElementById('cfg-start').value = cfg.start_date || '';
+  document.getElementById('cfg-end').value = cfg.end_date || '';
+  document.getElementById('cfg-markets').value = (cfg.markets || []).map(m => m.asset + ':' + m.duration).join('\n');
+  document.getElementById('cfg-slugs').value = (cfg.slugs || []).join('\n');
+  document.getElementById('cfg-cids').value = (cfg.condition_ids || []).join('\n');
+  document.getElementById('cfg-events').value = (cfg.event_ids || []).map(String).join('\n');
+  document.getElementById('cfg-tags').value = (cfg.tags || []).join('\n');
+}
+
+async function saveConfig() {
+  const markets = document.getElementById('cfg-markets').value.trim().split('\n').filter(Boolean).map(l => {
+    const [a, d] = l.split(':');
+    return {asset: a.trim(), duration: (d || '5m').trim()};
+  });
+  const lines = s => document.getElementById(s).value.trim().split('\n').filter(Boolean);
+  // Only the fields this form edits — the server merges them into config.yaml
+  // and preserves everything else (archive_version, data_dir, download,
+  // markets_snapshot, ...).
+  const cfg = {
+    start_date: document.getElementById('cfg-start').value.trim(),
+    end_date: document.getElementById('cfg-end').value.trim(),
+  };
+  if (markets.length) cfg.markets = markets;
+  const slugs = lines('cfg-slugs'); if (slugs.length) cfg.slugs = slugs;
+  const cids = lines('cfg-cids'); if (cids.length) cfg.condition_ids = cids;
+  const events = lines('cfg-events'); if (events.length) cfg.event_ids = events;
+  const tags = lines('cfg-tags'); if (tags.length) cfg.tags = tags;
+
+  const r = await fetch(API + '/api/config', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(cfg)});
+  const j = await r.json();
+  flash(j.ok ? 'Config saved' : 'Error: ' + j.error, j.ok);
+  loadStatus();
+  loadArchive();
+}
+
+// --- Status ---
+async function loadStatus() {
+  try {
+    const r = await fetch(API + '/api/status');
+    const s = await r.json();
+    document.getElementById('s-cids').textContent = s.condition_ids_count.toLocaleString();
+    document.getElementById('s-hours').textContent = s.hours_downloaded + '/' + s.hours_total;
+    document.getElementById('s-rows').textContent = s.orderbook.total_rows.toLocaleString();
+    document.getElementById('s-size').textContent = (s.orderbook.total_size_mb / 1000).toFixed(2) + ' GB';
+    document.getElementById('s-trades').textContent =
+      s.trades ? (s.trades.corrupt ? 'CORRUPT' : s.trades.rows.toLocaleString()) : '—';
+
+    const tbody = document.getElementById('files-body');
+    const maxRows = Math.max(...s.orderbook.files.map(f => f.rows || 0), 1);
+    tbody.innerHTML = s.orderbook.files.map(f =>
+      f.corrupt
+        ? `<tr><td>${f.name}</td><td class="corrupt-tag">CORRUPT</td><td>${f.size_mb} MB</td><td class="bar-cell"></td></tr>`
+        : `<tr><td>${f.name}</td><td>${f.rows.toLocaleString()}</td><td>${f.size_mb} MB</td><td class="bar-cell"><div class="bar"><i style="width:${f.rows/maxRows*100}%"></i></div></td></tr>`
+    ).join('');
+  } catch(e) {}
+}
+
+// --- Archive feed ---
+let archiveLatestEnd = null;
+
+function fmtAge(sec) {
+  if (sec == null || sec < 0) return '—';
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600),
+        m = Math.floor(sec % 3600 / 60), s = Math.floor(sec % 60);
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  return `${m}m ${s}s`;
+}
+
+function tickAge() {
+  if (archiveLatestEnd == null) return;
+  const sec = Math.floor(Date.now() / 1000) - archiveLatestEnd;
+  const el = document.getElementById('feed-age');
+  el.textContent = fmtAge(sec);
+  el.className = 'feed-age ' + (sec < 2 * 3600 ? 'ok' : sec < 6 * 3600 ? 'warn' : 'stale');
+}
+setInterval(tickAge, 1000);
+
+async function loadArchive(force) {
+  const meta = document.getElementById('feed-meta');
+  if (force) meta.innerHTML = '<span class="feed-dot ok"></span>rescanning archive listing…';
+  try {
+    const r = await fetch(API + '/api/archive' + (force ? '?force=1' : ''));
+    const a = await r.json();
+    if (a.error) { meta.innerHTML = `<span class="feed-dot stale"></span>${esc(a.error)}`; return; }
+    if (a.scan_failed) {
+      meta.innerHTML = '<span class="feed-dot stale"></span>archive listing unreachable — coverage shown as unknown, not missing';
+    }
+
+    archiveLatestEnd = a.latest_end_ts;
+    tickAge();
+    document.getElementById('s-age').textContent = fmtAge(a.age_seconds);
+    document.getElementById('s-age').className = 'stat-value ' +
+      (a.age_seconds < 2 * 3600 ? '' : a.age_seconds < 6 * 3600 ? 'amber' : 'red');
+
+    if (!a.scan_failed) {
+      const state = a.age_seconds < 2 * 3600 ? 'ok' : a.age_seconds < 6 * 3600 ? 'warn' : 'stale';
+      meta.innerHTML = `
+        <span class="feed-dot ${state}"></span>latest file <b>${a.latest_file_hour || '?'}</b><br>
+        ${a.files_seen.toLocaleString()} files in listing scan${a.scan_truncated ? ' (scan depth reached)' : ''}<br>
+        listing cached ${fmtAge(a.cached_age_seconds)} ago`;
+    }
+
+    // hour grid grouped by date
+    const byDate = {};
+    (a.hours || []).forEach(h => { (byDate[h.date] = byDate[h.date] || []).push(h); });
+    document.getElementById('hour-grid').innerHTML = Object.entries(byDate).map(([d, hs]) =>
+      `<div class="hour-row"><div class="hour-date">${d}</div><div class="hour-cells">${
+        hs.map(h => `<div class="cell ${h.state}" title="${d}T${h.hour} — ${h.state}"></div>`).join('')
+      }</div></div>`
+    ).join('');
+    document.getElementById('feed-legend').style.display = 'flex';
+
+    const missing = a.missing || [];
+    document.getElementById('missing-list').innerHTML = missing.length
+      ? `missing from archive: ` + missing.slice(0, 48).map(m => `<span class="chipm">${esc(m)}</span>`).join('')
+        + (missing.length > 48 ? ` +${missing.length - 48} more` : '')
+      : '';
+  } catch(e) {
+    meta.innerHTML = '<span class="feed-dot stale"></span>archive scan failed';
+  }
+}
+
+// --- Search ---
+function debounceSearch() {
+  clearTimeout(searchTimeout);
+  searchTimeout = setTimeout(doSearch, 400);
+}
+
+async function doSearch() {
+  const q = document.getElementById('search-input').value.trim();
+  const div = document.getElementById('search-results');
+  const empty = document.getElementById('search-empty');
+  if (q.length < 2) { div.innerHTML = ''; empty.classList.add('hidden'); return; }
+
+  const r = await fetch(API + '/api/search?q=' + encodeURIComponent(q));
+  const results = await r.json();
+
+  if (!results.length) {
+    div.innerHTML = '';
+    empty.classList.remove('hidden');
+    return;
+  }
+  empty.classList.add('hidden');
+  // Build DOM nodes (not an HTML string) so slugs/IDs never pass through a
+  // JS-string-in-onclick escaping context.
+  div.textContent = '';
+  results.forEach(m => {
+    const el = document.createElement('div');
+    el.className = 'search-result';
+    let chips = '';
+    if (m.resolved_outcome) chips += `<span class="chip res">→ ${esc(m.resolved_outcome)}</span>`;
+    else if (m.status) chips += `<span class="chip live">${esc(m.status)}</span>`;
+    chips += (m.tags || []).slice(0, 4).map(t => `<span class="chip">${esc(t)}</span>`).join('');
+    el.innerHTML = `
+      <div class="slug">${esc(m.slug)}</div>
+      <div class="question">${esc(m.question)}</div>
+      <div>${chips}</div>`;
+    el.addEventListener('click', () => addFromSearch(m.slug, m.condition_id));
+    div.appendChild(el);
+  });
+}
+
+function addFromSearch(slug, cid) {
+  const el = document.getElementById('cfg-slugs');
+  const current = el.value.trim();
+  if (!current.includes(slug)) {
+    el.value = current ? current + '\n' + slug : slug;
+    flash('Added: ' + slug, true);
+  }
+}
+
+// --- Markets snapshot ---
+let snapPoll = null;
+
+async function loadSnapshot() {
+  const meta = document.getElementById('snap-meta');
+  const btn = document.getElementById('snap-btn');
+  const barWrap = document.getElementById('snap-bar-wrap');
+  const bar = document.getElementById('snap-progress');
+  try {
+    const r = await fetch(API + '/api/snapshot');
+    const s = await r.json();
+
+    if (s.downloading) {
+      btn.disabled = true;
+      btn.textContent = 'Downloading…';
+      barWrap.classList.remove('hidden');
+      const mb = (s.bytes_done / 1e6).toFixed(0);
+      if (s.bytes_total) {
+        const pct = Math.round(s.bytes_done / s.bytes_total * 100);
+        bar.style.width = pct + '%';
+        bar.textContent = `${mb}/${(s.bytes_total / 1e6).toFixed(0)} MB`;
+      } else {
+        bar.style.width = '100%';
+        bar.textContent = `${mb} MB`;
+      }
+      meta.innerHTML = `<span class="feed-dot warn"></span>downloading snapshot from Telonex…`;
+      if (!snapPoll) snapPoll = setInterval(loadSnapshot, 1000);
+      return;
+    }
+
+    if (snapPoll) {
+      clearInterval(snapPoll); snapPoll = null;
+      barWrap.classList.add('hidden');
+      if (s.download_error) flash('Snapshot download failed: ' + s.download_error, false);
+      else if (s.download_done) { flash('Markets snapshot downloaded', true); doSearch(); }
+    }
+
+    btn.disabled = false;
+    if (s.present) {
+      btn.textContent = 'Refresh Snapshot';
+      const age = fmtAge(s.age_seconds);
+      meta.innerHTML = `<span class="feed-dot ok"></span><b>${(s.rows || 0).toLocaleString()}</b> markets ·
+        ${(s.size_mb / 1000).toFixed(2)} GB · downloaded <b>${age}</b> ago<br>${esc(s.path)}`;
+    } else {
+      btn.textContent = 'Download Snapshot (~600 MB)';
+      meta.innerHTML = `<span class="feed-dot stale"></span>no local snapshot —
+        search is limited to exact-slug Gamma lookups and downloads resolve
+        condition IDs one Gamma call at a time`;
+    }
+  } catch (e) {
+    meta.innerHTML = '<span class="feed-dot stale"></span>snapshot status unavailable';
+  }
+}
+
+async function startSnapshot() {
+  const btn = document.getElementById('snap-btn');
+  btn.disabled = true;
+  const r = await fetch(API + '/api/snapshot/download', {method: 'POST'});
+  const j = await r.json();
+  if (j.error) { flash(j.error, false); btn.disabled = false; return; }
+  loadSnapshot();
+}
+
+// --- Download ---
+let pollInterval = null;
+
+async function startDownload() {
+  const btn = document.getElementById('dl-btn');
+  btn.disabled = true;
+  const r = await fetch(API + '/api/download', {method: 'POST'});
+  const j = await r.json();
+  if (j.error) {
+    flash(j.error, false);
+    // 409 = a job is already running (e.g. started before a page reload) —
+    // attach to it instead of dead-ending.
+    if (r.status === 409) { attachDownload(); return; }
+    btn.disabled = false;
+    return;
+  }
+  if (!pollInterval) pollInterval = setInterval(pollDownload, 1000);
+}
+
+// Re-attach to a job that's already running (page reload / second tab)
+async function attachDownload() {
+  try {
+    const r = await fetch(API + '/api/download/status');
+    const s = await r.json();
+    if (s.running && !pollInterval) {
+      document.getElementById('dl-btn').disabled = true;
+      pollInterval = setInterval(pollDownload, 1000);
+      pollDownload();
+    }
+  } catch (e) {}
+}
+
+async function pollDownload() {
+  const r = await fetch(API + '/api/download/status');
+  const s = await r.json();
+
+  document.getElementById('dl-phase').textContent = s.phase || '';
+  const pct = s.total > 0 ? Math.round(s.progress / s.total * 100) : 0;
+  const bar = document.getElementById('dl-progress');
+  bar.style.width = (s.phase === 'done' ? 100 : pct) + '%';
+  bar.textContent = s.phase === 'done' ? 'Complete' : (s.total > 0 ? `${s.progress}/${s.total}` : '');
+
+  const log = document.getElementById('dl-log');
+  log.innerHTML = s.log.map(l => `<div class="line">${esc(l)}</div>`).join('');
+  log.scrollTop = log.scrollHeight;
+
+  if (!s.running) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+    document.getElementById('dl-btn').disabled = false;
+    if (s.error) flash('Download error: ' + s.error, false);
+    else if (s.done) flash('Download complete!', true);
+    loadStatus();
+    loadReport();
+    loadArchive();
+  }
+}
+
+// --- Report ---
+async function loadReport() {
+  try {
+    const r = await fetch(API + '/api/report');
+    const rpt = await r.json();
+    if (rpt.error) { document.getElementById('report-summary').innerHTML = `<span class="hint">${esc(rpt.error)}</span>`; return; }
+
+    const corrupt = rpt.corrupt_files || [];
+    document.getElementById('report-corrupt').innerHTML = corrupt.length
+      ? 'corrupt files (excluded): ' + corrupt.map(f => `<span class="chipm">${esc(f)}</span>`).join('')
+      : '';
+
+    const total = rpt.total_markets || 1;
+    document.getElementById('report-summary').innerHTML = `
+      <div class="stat"><div class="stat-value">${rpt.total_markets}</div><div class="stat-label">Total Markets</div></div>
+      <div class="stat"><div class="stat-value">${rpt.with_orderbook}<small>${Math.round(rpt.with_orderbook/total*100)}%</small></div><div class="stat-label">With Orderbook</div></div>
+      <div class="stat"><div class="stat-value">${rpt.with_trades}</div><div class="stat-label">With Trades</div></div>
+      <div class="stat"><div class="stat-value">${rpt.with_resolutions}</div><div class="stat-label">With Resolutions</div></div>
+      <div class="stat"><div class="stat-value">${rpt.with_all}</div><div class="stat-label">Complete (All 3)</div></div>
+    `;
+
+    const types = rpt.by_type || {};
+    let typeHtml = '<table><thead><tr><th>Type</th><th>Total</th><th>Orderbook</th><th>Trades</th><th>Resolved</th><th>All 3</th></tr></thead><tbody>';
+    for (const [k, v] of Object.entries(types)) {
+      typeHtml += `<tr><td>${esc(k)}</td><td>${v.total}</td><td>${v.ob} (${Math.round(v.ob/v.total*100)}%)</td><td>${v.trades}</td><td>${v.res}</td><td>${v.all}</td></tr>`;
+    }
+    typeHtml += '</tbody></table>';
+    document.getElementById('report-types').innerHTML = typeHtml;
+
+    const hours = rpt.by_hour || {};
+    let hourHtml = '<table><thead><tr><th>Hour (UTC)</th><th>Coverage</th><th></th></tr></thead><tbody>';
+    for (const [h, v] of Object.entries(hours)) {
+      const pct = v.total > 0 ? Math.round(v.with_ob / v.total * 100) : 0;
+      hourHtml += `<tr><td>${h.padStart(2,'0')}:00</td><td>${v.with_ob}/${v.total} (${pct}%)</td><td class="bar-cell"><div class="bar"><i class="green" style="width:${pct}%"></i></div></td></tr>`;
+    }
+    hourHtml += '</tbody></table>';
+    document.getElementById('report-hours').innerHTML = hourHtml;
+  } catch(e) {}
+}
+
+// --- Utilities ---
+function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+
+function flash(msg, ok) {
+  const el = document.getElementById('flash');
+  el.innerHTML = `<div class="flash ${ok ? 'flash-ok' : 'flash-err'}">${esc(msg)}</div>`;
+  setTimeout(() => el.innerHTML = '', 4000);
+}
+
+// Init
+loadConfig();
+loadStatus();
+loadReport();
+loadArchive();
+loadSnapshot();
+attachDownload();
+</script>
+</body>
+</html>
