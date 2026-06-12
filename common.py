@@ -12,6 +12,10 @@ import yaml
 CONFIG_FILE = Path(__file__).parent / "config.yaml"
 GAMMA_API = "https://gamma-api.polymarket.com/events"
 DATA_API = "https://data-api.polymarket.com/trades"
+# Telonex serves the full Polymarket markets dataset (1.28M+ markets: slugs,
+# condition IDs, questions, outcomes, resolutions, tags, data-coverage dates)
+# as a single parquet at a public endpoint — free, no API key.
+TELONEX_MARKETS_URL = "https://api.telonex.io/v1/datasets/polymarket/markets"
 PMXT_ENDPOINTS = {
     "v2": {
         "archive": "https://archive.pmxt.dev/Polymarket/v2",
@@ -98,6 +102,139 @@ def load_checkpoint(cfg):
 def save_checkpoint(cfg, cp):
     with open(checkpoint_path(cfg), "w") as f:
         json.dump(cp, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Markets snapshot (Telonex)
+# ---------------------------------------------------------------------------
+
+def _raw_config():
+    """Load config.yaml without validation (snapshot helpers must work even
+    when no market selectors are configured yet)."""
+    try:
+        with open(CONFIG_FILE) as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def snapshot_dest():
+    """Default path the markets snapshot is downloaded to (inside data_dir)."""
+    cfg = _raw_config()
+    d = Path(__file__).parent / cfg.get("data_dir", "data")
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "polymarket_markets.parquet"
+
+
+def find_markets_snapshot():
+    """Locate an existing markets snapshot parquet.
+
+    Order: explicit `markets_snapshot:` config override, then the default
+    download location in data_dir, then a couple of conventional spots.
+    Returns a Path or None.
+    """
+    cfg = _raw_config()
+    candidates = []
+    override = cfg.get("markets_snapshot")
+    if override:
+        candidates.append(Path(override).expanduser())
+    candidates.append(
+        Path(__file__).parent / cfg.get("data_dir", "data") / "polymarket_markets.parquet"
+    )
+    candidates += [
+        Path(__file__).parent / "polymarket_markets.parquet",
+        Path.home() / "Downloads" / "polymarket_markets.parquet",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def snapshot_status():
+    """Status of the local snapshot: path, size, age, row count. None if absent."""
+    p = find_markets_snapshot()
+    if p is None:
+        return None
+    st = p.stat()
+    info = {
+        "path": str(p),
+        "size_mb": round(st.st_size / 1e6, 1),
+        "age_seconds": int(time.time() - st.st_mtime),
+    }
+    try:
+        import pyarrow.parquet as pq
+        info["rows"] = pq.read_metadata(p).num_rows
+    except Exception:
+        info["rows"] = None
+    return info
+
+
+def download_markets_snapshot(dest=None, progress=None):
+    """Stream-download the markets dataset from Telonex (free, no API key).
+
+    progress: optional callback(bytes_done, bytes_total_or_None), called per chunk.
+    Writes to a temp file and renames atomically, so a torn download never
+    replaces a good snapshot. Returns the destination Path.
+    """
+    import secrets
+    dest = Path(dest) if dest else snapshot_dest()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # Unique temp name: concurrent downloads (CLI + dashboard) must not
+    # interleave writes into the same file.
+    tmp = dest.parent / f"{dest.name}.{secrets.token_hex(8)}.tmp"
+
+    try:
+        with requests.get(
+            TELONEX_MARKETS_URL, stream=True, timeout=120, allow_redirects=True
+        ) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("Content-Length") or 0) or None
+            done = 0
+            with open(tmp, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
+                    f.write(chunk)
+                    done += len(chunk)
+                    if progress:
+                        progress(done, total)
+
+        # A truncated body would poison every consumer — verify parquet magic.
+        with open(tmp, "rb") as f:
+            head = f.read(4)
+            f.seek(-4, 2)
+            tail = f.read(4)
+        if head != b"PAR1" or tail != b"PAR1":
+            raise RuntimeError("Downloaded snapshot is not a valid parquet file")
+
+        tmp.replace(dest)
+        return dest
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def snapshot_lookup_slugs(snapshot, slugs):
+    """Bulk slug -> condition_id resolution from the local snapshot.
+
+    One DuckDB join instead of one Gamma API call per slug. Returns a dict
+    covering only the slugs present in the snapshot; resolve the rest via
+    the API.
+    """
+    if not slugs:
+        return {}
+    import duckdb
+    con = duckdb.connect()
+    try:
+        con.execute("CREATE TEMP TABLE wanted(slug VARCHAR)")
+        con.executemany("INSERT INTO wanted VALUES (?)", [(s,) for s in slugs])
+        rows = con.execute(
+            f"""SELECT m.slug, m.market_id
+                FROM read_parquet('{snapshot}') m
+                JOIN wanted w ON m.slug = w.slug
+                WHERE m.market_id IS NOT NULL AND m.market_id != ''"""
+        ).fetchall()
+    finally:
+        con.close()
+    return {s: (c if c.startswith("0x") else f"0x{c}") for s, c in rows}
 
 
 def parse_date_spec(s):
@@ -282,6 +419,7 @@ def _resolve_updown_markets(cfg, session, progress=True):
     if start_ts >= end_ts:
         return {}
 
+    snapshot = find_markets_snapshot()
     all_cids = {}
     for market_cfg in markets_cfg:
         asset = market_cfg["asset"]
@@ -292,6 +430,18 @@ def _resolve_updown_markets(cfg, session, progress=True):
 
         if progress:
             print(f"Discovering {asset}-updown-{duration}: {len(slugs)} markets...", flush=True)
+
+        # Local snapshot first (one bulk join, instant); Gamma only for misses
+        # (markets newer than the snapshot, or that never existed).
+        snap_found = 0
+        if snapshot:
+            hits = snapshot_lookup_slugs(snapshot, slugs)
+            all_cids.update(hits)
+            snap_found = len(hits)
+            slugs = [s for s in slugs if s not in hits]
+            if progress and snap_found:
+                print(f"  {snap_found} resolved from local snapshot, "
+                      f"{len(slugs)} left for Gamma API", flush=True)
 
         found = errors = 0
         for i, slug in enumerate(slugs):
@@ -304,7 +454,8 @@ def _resolve_updown_markets(cfg, session, progress=True):
                 print(f"  [{i+1}/{len(slugs)}] found={found} errors={errors}", flush=True)
 
         if progress:
-            print(f"  Done: {found} found, {errors} errors", flush=True)
+            print(f"  Done: {snap_found + found} found "
+                  f"({snap_found} snapshot, {found} Gamma), {errors} errors", flush=True)
 
     return all_cids
 
@@ -330,12 +481,18 @@ def resolve_all_condition_ids(cfg, progress=True):
     # 2. Updown markets (asset+duration pattern)
     all_cids.update(_resolve_updown_markets(cfg, session, progress))
 
-    # 3. Arbitrary slugs
-    slugs_cfg = cfg.get("slugs", [])
+    # 3. Arbitrary slugs — snapshot first, Gamma for the misses
+    slugs_cfg = list(cfg.get("slugs", []))
     if slugs_cfg:
         if progress:
             print(f"Resolving {len(slugs_cfg)} slug(s)...", flush=True)
         found = 0
+        snapshot = find_markets_snapshot()
+        if snapshot:
+            hits = snapshot_lookup_slugs(snapshot, slugs_cfg)
+            all_cids.update(hits)
+            found += len(hits)
+            slugs_cfg = [s for s in slugs_cfg if s not in hits]
         for slug in slugs_cfg:
             cid = _gamma_lookup_slug(session, slug)
             if cid:
@@ -343,7 +500,7 @@ def resolve_all_condition_ids(cfg, progress=True):
                 found += 1
             time.sleep(0.2)
         if progress:
-            print(f"  Done: {found}/{len(slugs_cfg)} found", flush=True)
+            print(f"  Done: {found} found", flush=True)
 
     # 4. Event IDs — all markets under each event
     for event_id in cfg.get("event_ids", []):

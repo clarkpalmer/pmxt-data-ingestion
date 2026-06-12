@@ -23,6 +23,7 @@ from common import (
     date_range, hour_range, timestamp_range,
     discover_condition_ids, get_archive_file_list, archive_endpoints,
     duration_seconds, market_slug,
+    download_markets_snapshot, find_markets_snapshot, snapshot_status,
 )
 
 app = Flask(__name__, template_folder="templates")
@@ -169,26 +170,59 @@ def get_status():
     })
 
 
+# --- Markets Snapshot API ---
+
+_snap_job = {
+    "running": False, "bytes_done": 0, "bytes_total": None,
+    "error": None, "done": False,
+}
+
+
+@app.route("/api/snapshot")
+def get_snapshot():
+    info = snapshot_status() or {"present": False}
+    if "path" in info:
+        info["present"] = True
+    info.update({
+        "downloading": _snap_job["running"],
+        "bytes_done": _snap_job["bytes_done"],
+        "bytes_total": _snap_job["bytes_total"],
+        "download_error": _snap_job["error"],
+        "download_done": _snap_job["done"],
+    })
+    return jsonify(info)
+
+
+def _run_snapshot_download():
+    def progress(done, total):
+        _snap_job["bytes_done"] = done
+        _snap_job["bytes_total"] = total
+
+    try:
+        download_markets_snapshot(progress=progress)
+        _snap_job["done"] = True
+    except Exception as e:
+        _snap_job["error"] = str(e)
+    finally:
+        _snap_job["running"] = False
+
+
+@app.route("/api/snapshot/download", methods=["POST"])
+def start_snapshot_download():
+    with _job_lock:
+        if _snap_job["running"]:
+            return jsonify({"error": "Snapshot download already in progress"}), 409
+        _snap_job.update(running=True, bytes_done=0, bytes_total=None,
+                         error=None, done=False)
+    threading.Thread(target=_run_snapshot_download, daemon=True).start()
+    return jsonify({"ok": True})
+
+
 # --- Market Search API ---
 
-def _find_markets_snapshot():
-    candidates = []
-    try:
-        with open(CONFIG_FILE) as f:
-            snap = (yaml.safe_load(f) or {}).get("markets_snapshot")
-        if snap:
-            candidates.append(Path(snap).expanduser())
-    except Exception:
-        pass
-    candidates += [
-        Path.home() / "Downloads" / "polymarket_markets.parquet",
-        Path.home() / "dev" / "ml-polybot" / "datasets" / "polymarket_markets.parquet",
-        Path.home() / "dev" / "ml-polybot" / "data" / "metadata" / "polymarket_markets.parquet",
-        Path(__file__).parent / "polymarket_markets.parquet",
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
+def _resolved_outcome(status, result_id, out0, out1):
+    if status == "resolved" and result_id in ("0", "1"):
+        return out0 if result_id == "0" else out1
     return None
 
 
@@ -199,18 +233,19 @@ def search_markets():
         return jsonify([])
 
     # Search local markets snapshot (instant); falls back to Gamma API below
-    snapshot = _find_markets_snapshot()
+    snapshot = find_markets_snapshot()
     if snapshot:
         try:
             con = duckdb.connect()
             terms = [t.replace("'", "''") for t in q.lower().split()]
             where = " AND ".join(
-                f"(LOWER(slug) LIKE '%{t}%' OR LOWER(question) LIKE '%{t}%' OR LOWER(event_title) LIKE '%{t}%')"
+                f"(LOWER(slug) LIKE '%{t}%' OR LOWER(question) LIKE '%{t}%'"
+                f" OR LOWER(event_title) LIKE '%{t}%' OR market_id LIKE '%{t}%')"
                 for t in terms
             )
             rows = con.execute(f"""
                 SELECT slug, question, market_id, event_id, event_title,
-                       tags
+                       tags, status, result_id, outcome_0, outcome_1
                 FROM read_parquet('{snapshot}')
                 WHERE {where}
                 LIMIT 50
@@ -218,13 +253,15 @@ def search_markets():
             con.close()
 
             results = []
-            for slug, question, cid, eid, etitle, tags in rows:
+            for slug, question, cid, eid, etitle, tags, status, rid, out0, out1 in rows:
                 results.append({
                     "slug": slug or "",
                     "question": question or etitle or "",
                     "condition_id": cid or "",
                     "event_id": str(eid or ""),
                     "tags": tags or [],
+                    "status": status or "",
+                    "resolved_outcome": _resolved_outcome(status, rid, out0, out1),
                 })
             return jsonify(results)
         except Exception:
@@ -251,6 +288,52 @@ def search_markets():
         pass
 
     return jsonify(results[:50])
+
+
+@app.route("/api/market/<path:key>")
+def market_lookup(key):
+    """Full metadata for one market, by exact slug or condition ID (snapshot)."""
+    snapshot = find_markets_snapshot()
+    if snapshot is None:
+        return jsonify({"error": "No markets snapshot — download one first"}), 404
+
+    k = key.strip().replace("'", "''")
+    con = duckdb.connect()
+    try:
+        row = con.execute(f"""
+            SELECT slug, market_id, event_id, event_slug, event_title, question,
+                   category, outcome_0, outcome_1, asset_id_0, asset_id_1,
+                   status, result_id, settled_at_us, start_date_us, end_date_us,
+                   tags, trades_from, trades_to,
+                   book_snapshot_full_from, book_snapshot_full_to
+            FROM read_parquet('{snapshot}')
+            WHERE slug = '{k}' OR market_id = '{k}'
+            LIMIT 1
+        """).fetchone()
+    finally:
+        con.close()
+
+    if row is None:
+        return jsonify({"error": f"No market matching {key!r} in snapshot"}), 404
+
+    (slug, cid, eid, eslug, etitle, question, category, out0, out1,
+     aid0, aid1, status, rid, settled_us, start_us, end_us,
+     tags, t_from, t_to, b_from, b_to) = row
+    return jsonify({
+        "slug": slug, "condition_id": cid,
+        "event_id": str(eid or ""), "event_slug": eslug, "event_title": etitle,
+        "question": question, "category": category,
+        "outcomes": [out0, out1], "asset_ids": [aid0, aid1],
+        "status": status,
+        "resolved_outcome": _resolved_outcome(status, rid, out0, out1),
+        "settled_at_us": settled_us,
+        "start_date_us": start_us, "end_date_us": end_us,
+        "tags": tags or [],
+        "coverage": {
+            "trades": [t_from, t_to],
+            "book_snapshot_full": [b_from, b_to],
+        },
+    })
 
 
 # --- Archive Freshness API ---

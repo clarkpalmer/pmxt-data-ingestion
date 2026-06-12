@@ -28,6 +28,10 @@ pip install -r requirements.txt
 # Edit config.yaml to set your date range and markets
 # Then:
 
+# 0. (Recommended) Grab the markets snapshot — instant search + offline
+#    condition-ID resolution. ~600 MB, free, no API key. Asks before downloading.
+python snapshot.py
+
 # 1. Download orderbook data (with auto-resume)
 python download.py
 
@@ -114,12 +118,35 @@ python dashboard.py --port 8080 --host 0.0.0.0
 **Features:**
 - **Archive feed monitor** — shows the age of the newest published archive file (live ticking) and a per-hour coverage grid for your configured range: downloaded / available-not-downloaded / **missing from the archive** / not yet published. Catches archive outages and gaps at a glance.
 - **Config editor** — all market selectors (updown markets, slugs, condition IDs, event IDs, tags) plus date range, written straight to `config.yaml`.
-- **Market search** — instant full-text search over a local Polymarket markets snapshot parquet if you have one (set `markets_snapshot: /path/to/polymarket_markets.parquet` in `config.yaml`); falls back to a Gamma API exact-slug lookup otherwise. Click a result to add it to your slugs.
+- **Market search** — instant full-text search (slug, question, title, condition ID) over the local markets snapshot; falls back to a Gamma API exact-slug lookup if you don't have one. Results show resolution status. Click a result to add it to your slugs.
+- **Markets snapshot panel** — offers to download the snapshot if missing (one click, with progress), and shows its age / row count / size with a refresh button. See [Markets snapshot](#markets-snapshot) below.
 - **Download manager** — runs the discover → list → download → filter → merge pipeline in the background with a progress bar and live log.
 - **Coverage report** — per-market-type and per-hour coverage of orderbook / trades / resolutions.
 - **Data files** — row counts and sizes for every output parquet; corrupt (truncated) files are detected and flagged instead of crashing the page.
 
+## Markets Snapshot
+
+[Telonex](https://telonex.io) serves the **full Polymarket markets dataset** — 1.28M+ markets with slugs, condition IDs, questions, outcomes, resolution status/result, tags, and per-channel data-coverage dates — as a single parquet at a **free public endpoint (no API key)**. A local copy powers:
+
+- **Instant market search** in the dashboard (full-text over slug / question / title / condition ID)
+- **Offline slug → condition-ID resolution** during downloads: one bulk DuckDB join instead of one rate-limited Gamma API call per market (a full day of BTC 5m markets resolves in ~1s instead of ~1min). Markets newer than the snapshot still resolve via Gamma automatically.
+- **Metadata lookups** — resolutions, titles, tags, coverage dates
+
+```bash
+python snapshot.py                  # status + ask-before-download (~600 MB)
+python snapshot.py --yes            # download/refresh without asking
+python snapshot.py --status         # status only
+python snapshot.py --lookup btc-updown-5m-1771811400   # by slug…
+python snapshot.py --lookup 0x9e7cdbe6d66db90ad6ac…    # …or condition ID
+```
+
+The snapshot lands in `data/polymarket_markets.parquet`. To use a copy stored elsewhere, set `markets_snapshot: /path/to/polymarket_markets.parquet` in `config.yaml`. Everything works without a snapshot — discovery just falls back to per-market Gamma API calls.
+
 ## Scripts
+
+### `snapshot.py` — Markets Snapshot
+
+Downloads and inspects the local markets snapshot (see [Markets snapshot](#markets-snapshot)). Asks before downloading; `--lookup` resolves any slug or condition ID to full metadata from the command line.
 
 ### `download.py` — Download & Filter Orderbook Data
 
@@ -132,7 +159,7 @@ python download.py --discover   # Only discover condition IDs (no download)
 ```
 
 **How it works:**
-1. Discovers condition IDs for your markets via the Gamma API
+1. Discovers condition IDs for your markets — bulk-resolved from the local [markets snapshot](#markets-snapshot) when present, Gamma API for the rest
 2. Downloads each hourly archive file
 3. Filters to only rows matching your condition IDs (using DuckDB)
 4. Deletes the raw file, saves the filtered chunk
@@ -182,6 +209,7 @@ data/
 ├── trades/
 │   └── trades.parquet
 ├── resolutions.parquet
+├── polymarket_markets.parquet  # markets snapshot (snapshot.py / dashboard)
 ├── condition_ids.json          # slug → condition ID mapping
 └── checkpoint.json             # download/enrichment progress
 reports/
@@ -253,7 +281,7 @@ The `report.py` script gives a detailed breakdown of what has coverage and what'
 
 - The PMXT archive publishes hourly. Files typically appear within a few minutes of the hour.
 - Raw archive files are large (200MB-1.5GB). The script downloads one at a time, filters immediately, and deletes the raw file. Peak temp disk usage is ~1.5GB.
-- Condition ID discovery via the Gamma API takes ~1 request per market at 5 req/s. For a full day of BTC 5m markets (288), this takes about a minute.
+- Condition ID discovery via the Gamma API takes ~1 request per market at 5 req/s. For a full day of BTC 5m markets (288), this takes about a minute. With a local [markets snapshot](#markets-snapshot) it's a single DuckDB join (~1s) and only snapshot misses hit the API.
 - The Polymarket Data API has an offset cap of 3000 per market. Very high-volume markets may have truncated early-window trade data.
 - aria2c is optional but recommended — it uses multiple connections for ~2-4x faster downloads.
-- No API keys required — all data sources (PMXT archive, Gamma API, Polymarket Data API) are public.
+- No API keys required — all data sources (PMXT archive, Telonex markets dataset, Gamma API, Polymarket Data API) are public.

@@ -225,6 +225,8 @@
     border-radius: 2px; padding: 1px 7px; font-size: 0.66rem; margin: 3px 3px 0 0;
     color: var(--muted);
   }
+  .chip.res { color: var(--phos); border-color: var(--phos); background: var(--phos-dim); }
+  .chip.live { color: var(--amber); border-color: var(--amber); background: var(--amber-dim); }
 
   /* ---------- download ---------- */
   .progress-bar {
@@ -355,10 +357,23 @@
     <!-- Search Panel -->
     <div class="card">
       <h2>Search Markets</h2>
-      <input type="text" id="search-input" placeholder="Search by slug, title, or keyword…" oninput="debounceSearch()">
+      <input type="text" id="search-input" placeholder="Search by slug, title, condition ID…" oninput="debounceSearch()">
       <div class="hint">Searches the local markets snapshot (falls back to Gamma API by exact slug). Click a result to add it to your slugs.</div>
       <div id="search-results" class="search-results"></div>
       <div id="search-empty" class="hidden hint">No results</div>
+    </div>
+
+    <!-- Markets Snapshot Panel -->
+    <div class="card card-full">
+      <h2>Markets Snapshot</h2>
+      <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+        <div class="feed-meta" id="snap-meta"><span class="feed-dot warn"></span>checking…</div>
+        <div style="margin-left:auto"><button id="snap-btn" onclick="startSnapshot()" disabled>…</button></div>
+      </div>
+      <div class="progress-bar hidden" id="snap-bar-wrap"><div class="progress-fill" id="snap-progress" style="width:0%"></div></div>
+      <div class="hint">The full Polymarket markets dataset (1.28M+ markets: slugs, condition IDs, questions,
+        resolutions, tags, coverage dates) served free by Telonex — no API key. Powers instant search above,
+        offline condition-ID resolution during downloads, and <code>python snapshot.py --lookup</code>.</div>
     </div>
 
     <!-- Download Panel -->
@@ -548,11 +563,14 @@ async function doSearch() {
   }
   empty.classList.add('hidden');
   div.innerHTML = results.map(m => {
-    const tags = (m.tags || []).slice(0, 4).map(t => `<span class="chip">${esc(t)}</span>`).join('');
+    let chips = '';
+    if (m.resolved_outcome) chips += `<span class="chip res">→ ${esc(m.resolved_outcome)}</span>`;
+    else if (m.status) chips += `<span class="chip live">${esc(m.status)}</span>`;
+    chips += (m.tags || []).slice(0, 4).map(t => `<span class="chip">${esc(t)}</span>`).join('');
     return `<div class="search-result" onclick="addFromSearch('${esc(m.slug)}','${esc(m.condition_id)}')">
       <div class="slug">${esc(m.slug)}</div>
       <div class="question">${esc(m.question)}</div>
-      <div>${tags}</div>
+      <div>${chips}</div>
     </div>`;
   }).join('');
 }
@@ -564,6 +582,69 @@ function addFromSearch(slug, cid) {
     el.value = current ? current + '\n' + slug : slug;
     flash('Added: ' + slug, true);
   }
+}
+
+// --- Markets snapshot ---
+let snapPoll = null;
+
+async function loadSnapshot() {
+  const meta = document.getElementById('snap-meta');
+  const btn = document.getElementById('snap-btn');
+  const barWrap = document.getElementById('snap-bar-wrap');
+  const bar = document.getElementById('snap-progress');
+  try {
+    const r = await fetch(API + '/api/snapshot');
+    const s = await r.json();
+
+    if (s.downloading) {
+      btn.disabled = true;
+      btn.textContent = 'Downloading…';
+      barWrap.classList.remove('hidden');
+      const mb = (s.bytes_done / 1e6).toFixed(0);
+      if (s.bytes_total) {
+        const pct = Math.round(s.bytes_done / s.bytes_total * 100);
+        bar.style.width = pct + '%';
+        bar.textContent = `${mb}/${(s.bytes_total / 1e6).toFixed(0)} MB`;
+      } else {
+        bar.style.width = '100%';
+        bar.textContent = `${mb} MB`;
+      }
+      meta.innerHTML = `<span class="feed-dot warn"></span>downloading snapshot from Telonex…`;
+      if (!snapPoll) snapPoll = setInterval(loadSnapshot, 1000);
+      return;
+    }
+
+    if (snapPoll) {
+      clearInterval(snapPoll); snapPoll = null;
+      barWrap.classList.add('hidden');
+      if (s.download_error) flash('Snapshot download failed: ' + s.download_error, false);
+      else if (s.download_done) { flash('Markets snapshot downloaded', true); doSearch(); }
+    }
+
+    btn.disabled = false;
+    if (s.present) {
+      btn.textContent = 'Refresh Snapshot';
+      const age = fmtAge(s.age_seconds);
+      meta.innerHTML = `<span class="feed-dot ok"></span><b>${(s.rows || 0).toLocaleString()}</b> markets ·
+        ${(s.size_mb / 1000).toFixed(2)} GB · downloaded <b>${age}</b> ago<br>${esc(s.path)}`;
+    } else {
+      btn.textContent = 'Download Snapshot (~600 MB)';
+      meta.innerHTML = `<span class="feed-dot stale"></span>no local snapshot —
+        search is limited to exact-slug Gamma lookups and downloads resolve
+        condition IDs one Gamma call at a time`;
+    }
+  } catch (e) {
+    meta.innerHTML = '<span class="feed-dot stale"></span>snapshot status unavailable';
+  }
+}
+
+async function startSnapshot() {
+  const btn = document.getElementById('snap-btn');
+  btn.disabled = true;
+  const r = await fetch(API + '/api/snapshot/download', {method: 'POST'});
+  const j = await r.json();
+  if (j.error) { flash(j.error, false); btn.disabled = false; return; }
+  loadSnapshot();
 }
 
 // --- Download ---
@@ -652,6 +733,7 @@ loadConfig();
 loadStatus();
 loadReport();
 loadArchive();
+loadSnapshot();
 </script>
 </body>
 </html>
