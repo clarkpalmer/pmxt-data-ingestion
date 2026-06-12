@@ -12,8 +12,21 @@ import yaml
 CONFIG_FILE = Path(__file__).parent / "config.yaml"
 GAMMA_API = "https://gamma-api.polymarket.com/events"
 DATA_API = "https://data-api.polymarket.com/trades"
-PMXT_ARCHIVE = "https://archive.pmxt.dev/Polymarket/v2"
-PMXT_DOWNLOAD = "https://r2v2.pmxt.dev"
+PMXT_ENDPOINTS = {
+    "v2": {
+        "archive": "https://archive.pmxt.dev/Polymarket/v2",
+        "download": "https://r2v2.pmxt.dev",
+        "url_pattern": r'https://r2v2\.pmxt\.dev/[a-zA-Z0-9_.-]*parquet',
+    },
+    "v1": {
+        "archive": "https://archive.pmxt.dev/Polymarket",
+        "download": "https://r2.pmxt.dev",
+        "url_pattern": r'https://r2\.pmxt\.dev/[a-zA-Z0-9_.-]*parquet',
+    },
+}
+
+
+MARKET_SELECTORS = ["markets", "slugs", "condition_ids", "event_ids", "tags"]
 
 
 def load_config():
@@ -21,14 +34,30 @@ def load_config():
     with open(CONFIG_FILE) as f:
         cfg = yaml.safe_load(f)
 
-    # Validate required fields
-    for field in ["start_date", "end_date", "markets", "data_dir"]:
+    for field in ["start_date", "end_date", "data_dir"]:
         if field not in cfg:
             raise ValueError(f"Missing required config field: {field}")
 
+    has_selector = any(cfg.get(s) for s in MARKET_SELECTORS)
+    if not has_selector:
+        raise ValueError(
+            f"At least one market selector required: {', '.join(MARKET_SELECTORS)}"
+        )
+
     cfg["start_date"] = str(cfg["start_date"])
     cfg["end_date"] = str(cfg["end_date"])
+
+    version = cfg.get("archive_version", "v2")
+    if version not in PMXT_ENDPOINTS:
+        raise ValueError(f"Unknown archive_version: {version!r} (use 'v1' or 'v2')")
+    cfg["archive_version"] = version
+
     return cfg
+
+
+def archive_endpoints(cfg):
+    """Return the PMXT endpoint URLs for the configured archive version."""
+    return PMXT_ENDPOINTS[cfg["archive_version"]]
 
 
 def data_dir(cfg):
@@ -158,61 +187,119 @@ def market_slug(asset, duration, start_ts):
     return f"{asset}-updown-{duration}-{start_ts}"
 
 
-def discover_condition_ids(cfg, progress=True):
-    """Discover condition IDs for all configured markets via Gamma API.
+def _gamma_lookup_slug(session, slug):
+    """Look up a single slug via Gamma API. Returns condition_id or None."""
+    for attempt in range(3):
+        try:
+            resp = session.get(GAMMA_API, params={"slug": slug}, timeout=15)
+            if resp.status_code == 404 or not resp.text.strip() or resp.text.strip() == "[]":
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                return None
+            event = data[0] if isinstance(data, list) else data
+            markets = event.get("markets", [])
+            if markets:
+                cid = markets[0].get("conditionId", "")
+                if cid:
+                    return cid if cid.startswith("0x") else f"0x{cid}"
+            return None
+        except Exception:
+            if attempt < 2:
+                time.sleep(1)
+    return None
 
-    Returns dict: {slug: condition_id}
-    """
+
+def _gamma_lookup_event(session, event_id):
+    """Look up an event ID via Gamma API. Returns list of (slug, condition_id)."""
+    for attempt in range(3):
+        try:
+            resp = session.get(GAMMA_API, params={"id": event_id}, timeout=15)
+            if resp.status_code == 404 or not resp.text.strip() or resp.text.strip() == "[]":
+                return []
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                return []
+            event = data[0] if isinstance(data, list) else data
+            results = []
+            for m in event.get("markets", []):
+                cid = m.get("conditionId", "")
+                slug = m.get("slug", event.get("slug", f"event-{event_id}"))
+                if cid:
+                    cid = cid if cid.startswith("0x") else f"0x{cid}"
+                    results.append((slug, cid))
+            return results
+        except Exception:
+            if attempt < 2:
+                time.sleep(1)
+    return []
+
+
+def _gamma_search_tag(session, tag, limit=100):
+    """Search Gamma API by tag. Returns list of (slug, condition_id)."""
+    results = []
+    offset = 0
+    while True:
+        for attempt in range(3):
+            try:
+                resp = session.get(
+                    GAMMA_API,
+                    params={"tag": tag, "limit": limit, "offset": offset},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if not data:
+                    return results
+                for event in (data if isinstance(data, list) else [data]):
+                    for m in event.get("markets", []):
+                        cid = m.get("conditionId", "")
+                        slug = m.get("slug", event.get("slug", ""))
+                        if cid:
+                            cid = cid if cid.startswith("0x") else f"0x{cid}"
+                            results.append((slug, cid))
+                if len(data) < limit:
+                    return results
+                offset += limit
+                break
+            except Exception:
+                if attempt < 2:
+                    time.sleep(1)
+                else:
+                    return results
+    return results
+
+
+def _resolve_updown_markets(cfg, session, progress=True):
+    """Resolve the `markets` config (asset+duration updown pattern)."""
+    markets_cfg = cfg.get("markets", [])
+    if not markets_cfg:
+        return {}
+
     start_ts, end_ts = timestamp_range(cfg)
     if start_ts >= end_ts:
         return {}
 
     all_cids = {}
-    session = requests.Session()
-
-    for market_cfg in cfg["markets"]:
+    for market_cfg in markets_cfg:
         asset = market_cfg["asset"]
         duration = market_cfg["duration"]
         step = duration_seconds(duration)
 
-        slugs = []
-        for ts in range(start_ts, end_ts, step):
-            slugs.append(market_slug(asset, duration, ts))
+        slugs = [market_slug(asset, duration, ts) for ts in range(start_ts, end_ts, step)]
 
         if progress:
             print(f"Discovering {asset}-updown-{duration}: {len(slugs)} markets...", flush=True)
 
-        found = 0
-        errors = 0
+        found = errors = 0
         for i, slug in enumerate(slugs):
-            for attempt in range(3):
-                try:
-                    resp = session.get(GAMMA_API, params={"slug": slug}, timeout=15)
-                    if resp.status_code == 404 or not resp.text.strip() or resp.text.strip() == "[]":
-                        break
-                    resp.raise_for_status()
-                    data = resp.json()
-                    if not data:
-                        break
-                    event = data[0] if isinstance(data, list) else data
-                    markets = event.get("markets", [])
-                    if markets:
-                        cid = markets[0].get("conditionId", "")
-                        if cid:
-                            if not cid.startswith("0x"):
-                                cid = f"0x{cid}"
-                            all_cids[slug] = cid
-                            found += 1
-                    break
-                except Exception:
-                    if attempt < 2:
-                        time.sleep(1)
-                    else:
-                        errors += 1
-
-            # Rate limit: ~5 req/sec
+            cid = _gamma_lookup_slug(session, slug)
+            if cid:
+                all_cids[slug] = cid
+                found += 1
             time.sleep(0.2)
-
             if progress and (i + 1) % 100 == 0:
                 print(f"  [{i+1}/{len(slugs)}] found={found} errors={errors}", flush=True)
 
@@ -222,12 +309,86 @@ def discover_condition_ids(cfg, progress=True):
     return all_cids
 
 
-def get_archive_file_list():
+def resolve_all_condition_ids(cfg, progress=True):
+    """Resolve condition IDs from all configured selectors.
+
+    Supports: markets (updown), slugs, condition_ids, event_ids, tags.
+    Returns dict: {label: condition_id}
+    """
+    all_cids = {}
+    session = requests.Session()
+
+    # 1. Direct condition IDs — no API call needed
+    for cid in cfg.get("condition_ids", []):
+        cid = str(cid)
+        if not cid.startswith("0x"):
+            cid = f"0x{cid}"
+        all_cids[cid] = cid
+    if cfg.get("condition_ids") and progress:
+        print(f"Direct condition IDs: {len(cfg['condition_ids'])}", flush=True)
+
+    # 2. Updown markets (asset+duration pattern)
+    all_cids.update(_resolve_updown_markets(cfg, session, progress))
+
+    # 3. Arbitrary slugs
+    slugs_cfg = cfg.get("slugs", [])
+    if slugs_cfg:
+        if progress:
+            print(f"Resolving {len(slugs_cfg)} slug(s)...", flush=True)
+        found = 0
+        for slug in slugs_cfg:
+            cid = _gamma_lookup_slug(session, slug)
+            if cid:
+                all_cids[slug] = cid
+                found += 1
+            time.sleep(0.2)
+        if progress:
+            print(f"  Done: {found}/{len(slugs_cfg)} found", flush=True)
+
+    # 4. Event IDs — all markets under each event
+    for event_id in cfg.get("event_ids", []):
+        if progress:
+            print(f"Resolving event {event_id}...", flush=True)
+        pairs = _gamma_lookup_event(session, str(event_id))
+        for slug, cid in pairs:
+            all_cids[slug] = cid
+        if progress:
+            print(f"  Found {len(pairs)} market(s)", flush=True)
+        time.sleep(0.2)
+
+    # 5. Tags — search by tag
+    for tag in cfg.get("tags", []):
+        if progress:
+            print(f"Searching tag '{tag}'...", flush=True)
+        pairs = _gamma_search_tag(session, tag)
+        for slug, cid in pairs:
+            all_cids[slug] = cid
+        if progress:
+            print(f"  Found {len(pairs)} market(s)", flush=True)
+        time.sleep(0.2)
+
+    return all_cids
+
+
+def discover_condition_ids(cfg, progress=True):
+    """Discover condition IDs for all configured markets.
+
+    Legacy wrapper — calls resolve_all_condition_ids.
+    """
+    return resolve_all_condition_ids(cfg, progress)
+
+
+def get_archive_file_list(cfg):
     """Fetch list of available parquet files from the PMXT archive.
 
     Returns dict: {filename: url}
     """
-    print("Fetching file list from PMXT archive...", flush=True)
+    ep = archive_endpoints(cfg)
+    archive_url = ep["archive"]
+    url_pattern = ep["url_pattern"]
+    version = cfg["archive_version"]
+
+    print(f"Fetching file list from PMXT archive ({version})...", flush=True)
     session = requests.Session()
     all_urls = {}
     consecutive_empty = 0
@@ -236,11 +397,9 @@ def get_archive_file_list():
         urls = set()
         for attempt in range(3):
             try:
-                url = PMXT_ARCHIVE if page == 1 else f"{PMXT_ARCHIVE}?page={page}"
+                url = archive_url if page == 1 else f"{archive_url}?page={page}"
                 resp = session.get(url, timeout=30)
-                urls = set(re.findall(
-                    r'https://r2(?:v2)?\.pmxt\.dev/[a-zA-Z0-9_.-]*parquet', resp.text
-                ))
+                urls = set(re.findall(url_pattern, resp.text))
                 if urls:
                     break
                 time.sleep(1)

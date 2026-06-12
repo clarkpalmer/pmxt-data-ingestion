@@ -189,7 +189,7 @@ def main():
 
     if not cids or args.discover:
         print("=" * 60)
-        print("Step 1: Discovering condition IDs via Gamma API")
+        print("Step 1: Resolving condition IDs")
         print("=" * 60)
         cids = discover_condition_ids(cfg)
         cp["discovered_cids"] = cids
@@ -204,13 +204,14 @@ def main():
             return
 
     cid_set = set(cids.values())
-    print(f"\nUsing {len(cid_set)} condition IDs across {len(cfg['markets'])} market type(s)")
+    selectors = [s for s in ["markets", "slugs", "condition_ids", "event_ids", "tags"] if cfg.get(s)]
+    print(f"\nUsing {len(cid_set)} condition IDs (from: {', '.join(selectors)})")
 
     # Step 2: Get archive file list
     print("\n" + "=" * 60)
     print("Step 2: Fetching archive file list")
     print("=" * 60)
-    all_urls = get_archive_file_list()
+    all_urls = get_archive_file_list(cfg)
 
     # Filter to our hour range
     target_hours_set = set(hour_range(cfg))  # set of (date_str, hour_str)

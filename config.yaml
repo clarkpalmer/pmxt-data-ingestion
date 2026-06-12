@@ -1,9 +1,14 @@
+archive_version: v2
 data_dir: data
 download:
   connections: 4
   temp_dir: /tmp/pmxt_ingestion
 start_date: 2026-04-27T06
 end_date: 2026-04-27T10
+
+# --- Market selectors (use any combination) ---
+
+# Updown crypto markets (asset + duration shorthand)
 markets:
 - asset: btc
   duration: 5m
@@ -13,3 +18,22 @@ markets:
   duration: 5m
 - asset: xrp
   duration: 5m
+
+# Arbitrary market slugs (looked up via Gamma API)
+# slugs:
+#   - "will-bitcoin-reach-122k-september-15-21"
+#   - "ethereum-above-4100-on-november-2"
+#   - "nba-bos-cle-2026-03-08-spread-home-4pt5"
+
+# Direct condition IDs (no API lookup needed)
+# condition_ids:
+#   - "0x94b3610eec4e5ef8f9cd051db5f303b005299835d8e3f21dfc03ba3ff87c71e7"
+
+# Event IDs (fetches all markets under the event)
+# event_ids:
+#   - "196660"
+
+# Tags (searches Gamma API for matching events)
+# tags:
+#   - "crypto"
+#   - "esports"
