@@ -50,6 +50,22 @@ def _log(msg):
     _job["detail"] = msg
 
 
+def _partition_readable_parquets(con, files):
+    """Split parquet files into (readable, corrupt) by probing each footer.
+
+    A truncated download (no magic bytes at end of file) would otherwise
+    crash every query that touches the file list.
+    """
+    good, corrupt = [], []
+    for f in files:
+        try:
+            con.execute(f"SELECT 1 FROM read_parquet('{f}') LIMIT 1").fetchall()
+            good.append(f)
+        except Exception:
+            corrupt.append(f)
+    return good, corrupt
+
+
 # --- Config API ---
 
 @app.route("/")
@@ -100,12 +116,18 @@ def get_status():
     total_size = 0
     files_info = []
     con = duckdb.connect()
+    ob_files, corrupt_files = _partition_readable_parquets(con, ob_files)
     for f in ob_files:
         n = con.execute(f"SELECT COUNT(*) FROM read_parquet('{f}')").fetchone()[0]
         mb = f.stat().st_size / 1e6
         total_rows += n
         total_size += mb
         files_info.append({"name": f.name, "rows": n, "size_mb": round(mb, 1)})
+    for f in corrupt_files:
+        files_info.append({
+            "name": f.name, "rows": None,
+            "size_mb": round(f.stat().st_size / 1e6, 1), "corrupt": True,
+        })
     con.close()
 
     t_file = trades_dir(cfg) / "trades.parquet"
@@ -372,6 +394,8 @@ def get_report():
     con = duckdb.connect()
     all_cid_set = set(cids.values())
 
+    ob_files, corrupt_files = _partition_readable_parquets(con, ob_files)
+
     # Detect schema
     market_col = "market_id"
     type_col = "update_type"
@@ -456,6 +480,7 @@ def get_report():
         "with_all": len(has_all),
         "by_type": type_stats,
         "by_hour": {str(h): hourly[h] for h in sorted(hourly)},
+        "corrupt_files": [f.name for f in corrupt_files],
     })
 
 

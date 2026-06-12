@@ -199,9 +199,11 @@ async function loadStatus() {
     document.getElementById('s-trades').textContent = s.trades ? s.trades.rows.toLocaleString() : '-';
 
     const tbody = document.getElementById('files-body');
-    const maxRows = Math.max(...s.orderbook.files.map(f => f.rows), 1);
+    const maxRows = Math.max(...s.orderbook.files.map(f => f.rows || 0), 1);
     tbody.innerHTML = s.orderbook.files.map(f =>
-      `<tr><td>${f.name}</td><td>${f.rows.toLocaleString()}</td><td>${f.size_mb} MB</td><td class="bar-cell"><div class="bar" style="width:${f.rows/maxRows*100}%"></div></td></tr>`
+      f.corrupt
+        ? `<tr><td>${f.name}</td><td style="color:#f66">CORRUPT</td><td>${f.size_mb} MB</td><td class="bar-cell"></td></tr>`
+        : `<tr><td>${f.name}</td><td>${f.rows.toLocaleString()}</td><td>${f.size_mb} MB</td><td class="bar-cell"><div class="bar" style="width:${f.rows/maxRows*100}%"></div></td></tr>`
     ).join('');
   } catch(e) {}
 }
