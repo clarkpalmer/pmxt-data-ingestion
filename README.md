@@ -102,6 +102,23 @@ All selectors can be combined. At least one must be present.
 
 Both versions are supported. The download and report scripts auto-detect the parquet schema, so you can switch versions without changing anything else. Set `archive_version: v1` if you need the legacy format.
 
+## Web Dashboard
+
+A local web UI that wraps the whole pipeline — config editing, market search, one-click downloads with live progress, coverage reports, and archive-health monitoring.
+
+```bash
+python dashboard.py            # http://127.0.0.1:5555
+python dashboard.py --port 8080 --host 0.0.0.0
+```
+
+**Features:**
+- **Archive feed monitor** — shows the age of the newest published archive file (live ticking) and a per-hour coverage grid for your configured range: downloaded / available-not-downloaded / **missing from the archive** / not yet published. Catches archive outages and gaps at a glance.
+- **Config editor** — all market selectors (updown markets, slugs, condition IDs, event IDs, tags) plus date range, written straight to `config.yaml`.
+- **Market search** — instant full-text search over a local Polymarket markets snapshot parquet if you have one (set `markets_snapshot: /path/to/polymarket_markets.parquet` in `config.yaml`); falls back to a Gamma API exact-slug lookup otherwise. Click a result to add it to your slugs.
+- **Download manager** — runs the discover → list → download → filter → merge pipeline in the background with a progress bar and live log.
+- **Coverage report** — per-market-type and per-hour coverage of orderbook / trades / resolutions.
+- **Data files** — row counts and sizes for every output parquet; corrupt (truncated) files are detected and flagged instead of crashing the page.
+
 ## Scripts
 
 ### `download.py` — Download & Filter Orderbook Data

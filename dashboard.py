@@ -21,7 +21,7 @@ from common import (
     load_config, load_checkpoint, save_checkpoint,
     data_dir, orderbook_dir, trades_dir, condition_ids_path,
     date_range, hour_range, timestamp_range,
-    discover_condition_ids, get_archive_file_list,
+    discover_condition_ids, get_archive_file_list, archive_endpoints,
     duration_seconds, market_slug,
 )
 
@@ -172,7 +172,15 @@ def get_status():
 # --- Market Search API ---
 
 def _find_markets_snapshot():
-    candidates = [
+    candidates = []
+    try:
+        with open(CONFIG_FILE) as f:
+            snap = (yaml.safe_load(f) or {}).get("markets_snapshot")
+        if snap:
+            candidates.append(Path(snap).expanduser())
+    except Exception:
+        pass
+    candidates += [
         Path.home() / "Downloads" / "polymarket_markets.parquet",
         Path.home() / "dev" / "ml-polybot" / "datasets" / "polymarket_markets.parquet",
         Path.home() / "dev" / "ml-polybot" / "data" / "metadata" / "polymarket_markets.parquet",
@@ -184,20 +192,18 @@ def _find_markets_snapshot():
     return None
 
 
-MARKETS_SNAPSHOT = _find_markets_snapshot()
-
-
 @app.route("/api/search")
 def search_markets():
     q = request.args.get("q", "").strip()
     if len(q) < 2:
         return jsonify([])
 
-    # Search local markets snapshot (714K markets, instant)
-    if MARKETS_SNAPSHOT.exists():
+    # Search local markets snapshot (instant); falls back to Gamma API below
+    snapshot = _find_markets_snapshot()
+    if snapshot:
         try:
             con = duckdb.connect()
-            terms = q.lower().split()
+            terms = [t.replace("'", "''") for t in q.lower().split()]
             where = " AND ".join(
                 f"(LOWER(slug) LIKE '%{t}%' OR LOWER(question) LIKE '%{t}%' OR LOWER(event_title) LIKE '%{t}%')"
                 for t in terms
@@ -205,7 +211,7 @@ def search_markets():
             rows = con.execute(f"""
                 SELECT slug, question, market_id, event_id, event_title,
                        tags
-                FROM read_parquet('{MARKETS_SNAPSHOT}')
+                FROM read_parquet('{snapshot}')
                 WHERE {where}
                 LIMIT 50
             """).fetchall()
@@ -245,6 +251,178 @@ def search_markets():
         pass
 
     return jsonify(results[:50])
+
+
+# --- Archive Freshness API ---
+
+_archive_cache = {
+    "fetched_at": 0.0, "urls": None, "truncated": False, "oldest_scanned": None,
+    "head_checked": {},
+}
+_ARCHIVE_CACHE_TTL = 300
+_ARCHIVE_MAX_PAGES = 60
+_HEAD_CHECK_CAP = 30
+
+
+def _verify_missing_hours(cfg, urls, keys):
+    """The archive listing returns inconsistent pages between scans, so a key
+    absent from the listing is not necessarily absent from the archive.
+    HEAD-check the predicted file URL for each candidate; return the set of
+    keys that actually exist. Results are cached for the TTL window.
+    """
+    if not urls:
+        return set()
+    sample = next(iter(urls))
+    if not re.search(r"\d{4}-\d{2}-\d{2}T\d{2}", sample):
+        return set()
+    ep = archive_endpoints(cfg)
+    session = requests.Session()
+    exists = set()
+    checked = _archive_cache["head_checked"]
+    for key in list(keys)[:_HEAD_CHECK_CAP]:
+        if key in checked:
+            if checked[key]:
+                exists.add(key)
+            continue
+        fname = re.sub(r"\d{4}-\d{2}-\d{2}T\d{2}", f"{key[0]}T{key[1]}", sample)
+        try:
+            resp = session.head(f"{ep['download']}/{fname}", timeout=10, allow_redirects=True)
+            ok = resp.status_code == 200
+        except Exception:
+            ok = False
+        checked[key] = ok
+        if ok:
+            exists.add(key)
+    return exists
+
+
+def _scan_archive(cfg, oldest_needed):
+    """Page through the archive listing (newest-first) until we have covered
+    oldest_needed, the listing is exhausted, or the page cap is hit.
+
+    Returns (urls, truncated, oldest_scanned).
+    """
+    ep = archive_endpoints(cfg)
+    session = requests.Session()
+    urls = {}
+    oldest_scanned = None
+    consecutive_empty = 0
+    truncated = True
+    for page in range(1, _ARCHIVE_MAX_PAGES + 1):
+        try:
+            u = ep["archive"] if page == 1 else f"{ep['archive']}?page={page}"
+            resp = session.get(u, timeout=30)
+            found = set(re.findall(ep["url_pattern"], resp.text))
+        except Exception:
+            found = set()
+        if not found:
+            consecutive_empty += 1
+            if consecutive_empty >= 3:
+                truncated = False  # listing exhausted
+                break
+            continue
+        consecutive_empty = 0
+        for url in found:
+            fname = url.rsplit("/", 1)[1]
+            urls[fname] = url
+            m = re.search(r"(\d{4}-\d{2}-\d{2})T(\d{2})", fname)
+            if m:
+                key = (m.group(1), m.group(2))
+                if oldest_scanned is None or key < oldest_scanned:
+                    oldest_scanned = key
+        if oldest_needed and oldest_scanned and oldest_scanned <= oldest_needed:
+            truncated = False  # covered everything we need
+            break
+    return urls, truncated, oldest_scanned
+
+
+@app.route("/api/archive")
+def archive_status():
+    try:
+        cfg = load_config()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    target = hour_range(cfg)
+    oldest_needed = min(target) if target else None
+
+    now = time.time()
+    if _archive_cache["urls"] is None or now - _archive_cache["fetched_at"] > _ARCHIVE_CACHE_TTL:
+        urls, truncated, oldest_scanned = _scan_archive(cfg, oldest_needed)
+        _archive_cache.update(
+            fetched_at=now, urls=urls, truncated=truncated, oldest_scanned=oldest_scanned,
+            head_checked={},
+        )
+    urls = _archive_cache["urls"]
+    truncated = _archive_cache["truncated"]
+    oldest_scanned = _archive_cache["oldest_scanned"]
+
+    available = set()
+    latest = None
+    for fname in urls:
+        m = re.search(r"(\d{4}-\d{2}-\d{2})T(\d{2})", fname)
+        if m:
+            key = (m.group(1), m.group(2))
+            available.add(key)
+            if latest is None or key > latest:
+                latest = key
+
+    cp = load_checkpoint(cfg)
+    downloaded = set()
+    for fname in cp.get("downloaded_hours", []):
+        m = re.search(r"(\d{4}-\d{2}-\d{2})T(\d{2})", str(fname))
+        if m:
+            downloaded.add((m.group(1), m.group(2)))
+
+    # Per-hour state within the configured range:
+    #   downloaded > available > pending (newer than latest archive file)
+    #   > unknown (older than our truncated scan) > missing (archive gap)
+    # Listing pages are inconsistent between scans, so candidates for
+    # "missing" are HEAD-verified against the predicted file URL first.
+    candidates = set()
+    for key in target:
+        if (key not in downloaded and key not in available
+                and not (latest and key > latest)
+                and not (truncated and oldest_scanned and key < oldest_scanned)):
+            candidates.add(key)
+    available |= _verify_missing_hours(cfg, urls, sorted(candidates))
+
+    hours = []
+    for key in target:
+        d, h = key
+        if key in downloaded:
+            state = "downloaded"
+        elif key in available:
+            state = "available"
+        elif latest and key > latest:
+            state = "pending"
+        elif truncated and oldest_scanned and key < oldest_scanned:
+            state = "unknown"
+        else:
+            state = "missing"
+        hours.append({"date": d, "hour": h, "state": state})
+
+    latest_str = None
+    latest_end_ts = None
+    if latest:
+        latest_dt = datetime.strptime(f"{latest[0]}T{latest[1]}", "%Y-%m-%dT%H").replace(
+            tzinfo=timezone.utc
+        )
+        latest_str = f"{latest[0]}T{latest[1]}"
+        # The file covers a full hour, so archive data extends to file start + 1h
+        latest_end_ts = int(latest_dt.timestamp()) + 3600
+
+    return jsonify({
+        "latest_file_hour": latest_str,
+        "latest_end_ts": latest_end_ts,
+        "age_seconds": (int(now) - latest_end_ts) if latest_end_ts else None,
+        "files_seen": len(urls),
+        "scan_truncated": truncated,
+        "hours": hours,
+        "missing": [f"{d}T{h}" for d, h, in
+                    [(x["date"], x["hour"]) for x in hours if x["state"] == "missing"]],
+        "cached_age_seconds": int(now - _archive_cache["fetched_at"]),
+    })
 
 
 # --- Download Job API ---
@@ -299,7 +477,7 @@ def _run_download():
         # Phase 2: Get archive file list
         _job["phase"] = "listing"
         _log("Fetching archive file list...")
-        all_urls = get_archive_file_list()
+        all_urls = get_archive_file_list(cfg)
         target_hours_set = set(hour_range(cfg))
         downloaded = set(cp.get("downloaded_hours", []))
 
